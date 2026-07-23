@@ -673,7 +673,7 @@ def _lookup_override(overrides: Dict[ParameterKey, str],
 
 
 def _get_layer_base_color_samplers(layer_name: str,
-                                   graph: _MaterialGraph) -> List[Sampler]:
+                                   graph: '_MaterialGraph') -> List[Sampler]:
     """Samplers feeding the base colour of one material layer.
 
     A layer slot normally holds a layer *instance*, which contributes only
@@ -709,7 +709,7 @@ def _get_layer_base_color_samplers(layer_name: str,
 
 
 def _get_base_color_samplers(pkg: Package,
-                             graph: _MaterialGraph) -> List[Sampler]:
+                             graph: '_MaterialGraph') -> List[Sampler]:
     """List the texture samplers a master Material's BaseColor input reads.
 
     Walks the chain:

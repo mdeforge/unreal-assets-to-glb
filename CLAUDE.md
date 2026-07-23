@@ -20,6 +20,9 @@ package format directly — **no Unreal Engine installation is required at runti
 ## Running it
 
 ```bash
+# No arguments: print usage and the worked examples, then exit (same as --help)
+python main.py
+
 # Extract meshes + textures from ./Input into ./Export
 python main.py ./Input
 
@@ -50,7 +53,7 @@ in the wheel/sdist.
 
 | Flag | Meaning |
 | --- | --- |
-| `input_dir` (positional) | Folder containing `.uproject` + `Content/` (default `./Input`) |
+| `input_dir` (positional) | Folder containing `.uproject` + `Content/` (default `./Input`; omitting *every* argument prints help instead of running) |
 | `--preview LEVEL.umap` | Parse the level and serve a Three.js preview on port 3050 |
 | `--export-level LEVEL.umap` | Assemble the level into `Export/Levels/<Level>.glb`, actors positioned |
 | `--scale FACTOR` | UE-unit → glTF-unit scale (default `0.01`: UE cm → glTF m). `1.0` keeps centimetres |

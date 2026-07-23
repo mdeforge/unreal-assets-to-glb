@@ -1,20 +1,8 @@
 """
 UE 5.5 UAsset Parser, Exporter, and Level Previewer
 
-Usage:
-  python main.py [INPUT_DIR]           # Extract meshes + base color textures
-  python main.py [INPUT_DIR] --preview LEVEL.umap  # Extract + show level preview in browser
-  python main.py ./Input --skip-export --preview L_Showcase.umap  # Skip export, just preview
-  python main.py ./Input --skip-textures  # Embed textures in GLB but skip separate PNG export
-
-Arguments:
-  INPUT_DIR    Path to folder containing .uproject and Content/ (default: ./Input)
-
-Options:
-  --preview LEVEL.umap  Parse a .umap level file and show 3D preview in browser (port 3050)
-  --export-dir DIR      Output directory (default: ./Export)
-  --skip-export         Skip export step, use existing Export/ directory
-  --skip-textures       Skip separate PNG export (textures still embedded in GLB)
+Run with no arguments for usage and worked examples; the same text lives in
+``_EXAMPLES`` below and is shown by ``--help``.
 """
 import argparse
 import os
@@ -37,6 +25,43 @@ from uasset.scene import (
     _get_base_color_texture_from_material,
     package_path_for_file,
 )
+
+
+# Shown by --help and by a bare invocation.  argparse substitutes %(prog)s, so
+# this reads correctly whether it was reached through main.py or the installed
+# console script — but no other '%' may appear here or that substitution fails.
+_EXAMPLES = """\
+examples:
+  %(prog)s ./Input
+      Extract every static mesh to Export/Meshes/<Name>.glb and every
+      base-colour texture to Export/Textures/<Name>.png.
+
+  %(prog)s ./Input --export-level MainLevel.umap
+      Assemble the whole level into one GLB in Export/Levels/, with every
+      actor already positioned.
+
+  %(prog)s ./Input --skip-export --export-level MainLevel.umap
+      The same, reusing an existing Export/ (skips the per-mesh GLBs).
+
+  %(prog)s ./Input --preview L_Showcase.umap
+      Export, then serve a browser preview of the level on port 3050.
+
+  %(prog)s ./Input --skip-export --preview L_Showcase.umap
+      Preview an already-exported project without re-exporting it.
+
+  %(prog)s ./Input --skip-textures
+      Meshes only, no separate PNGs (textures are still embedded in the GLBs).
+
+  %(prog)s ./Input --filter Pipe
+      Only export meshes whose name contains "Pipe" (case-insensitive).
+
+  %(prog)s ./Input --scale 1.0
+      Keep UE centimetres instead of converting to glTF metres.
+
+INPUT_DIR must be an *uncooked* project folder: a .uproject at the top and a
+Content/ tree of .uasset / .umap files.  Cooked or packaged builds are not
+supported.
+"""
 
 
 def find_uproject(input_dir):
@@ -457,7 +482,9 @@ def preview_level(input_dir, export_dir, umap_filename):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="UE 5.5 UAsset Parser, Exporter, and Level Previewer"
+        description="UE 5.5 UAsset Parser, Exporter, and Level Previewer",
+        epilog=_EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         'input_dir', nargs='?', default='./Input',
@@ -492,6 +519,13 @@ def main():
         help='UE-unit to glTF-unit scale (default %(default)s: UE centimetres '
              'to glTF metres). Pass 1.0 to keep UE centimetres.'
     )
+
+    # A bare invocation is far more likely to be someone asking "what does this
+    # do?" than a request to export ./Input, so show the usage instead.
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return
+
     args = parser.parse_args()
 
     if args.scale <= 0:
