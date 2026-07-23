@@ -57,9 +57,10 @@ in the wheel/sdist.
   `.uasset` / `.umap` files. Cooked/packaged builds are not supported.
 - **Output** goes to `./Export/`:
   - `Export/Meshes/<Name>.glb`
-  - `Export/Textures/<Name>.png`
-  - `Export/texture_cache.pkl` — pickle cache of decoded texture pixels, keyed by an md5
-    fingerprint of the input textures' names/mtimes/sizes. Delete it to force a re-decode.
+  - `Export/Textures/<Name>.png` — `<Name>_2.png` etc. where two assets share a name
+  - `Export/texture_cache.pkl` — pickle cache of decoded texture pixels keyed by package path,
+    guarded by an md5 fingerprint of the input textures' paths/mtimes/sizes. Delete it to force a
+    re-decode.
 - `Input/`, `Export/`, and `UnrealEngine-5.5.0-release/` are gitignored — never commit them.
 
 ## Environment
@@ -83,7 +84,7 @@ Everything lives in the `uasset/` package. Parsing pipeline, roughly:
 
 | Module | Responsibility |
 | --- | --- |
-| `cli.py` | Argument parsing, asset discovery/classification, the export loop, texture cache, preview launch |
+| `cli.py` | Argument parsing, asset discovery/classification, the export loop, path-keyed texture cache and PNG naming, preview launch |
 | `reader.py` | `BinaryReader` — typed reads over the raw byte stream |
 | `package.py` | `.uasset` package header: summary, name map, imports/exports, UE version constants. Note UE5 puts `FileVersionUE5` **before** `FileVersionLicenseeUE4` |
 | `properties.py` | Property-tag parsing/skipping; handles both the UE4-style and the newer `PROPERTY_TAG_COMPLETE_TYPE_NAME` format. `skip_properties` for mesh/texture, `read_properties` for umap, `read_property_tag`/`end_property_tag`/`has_serialization_control_byte` for callers that walk tags themselves |
@@ -146,6 +147,28 @@ export**, not the file name — `MI_SpaceShip_1.uasset` can contain an asset cal
 and that is the name importing packages use. File names are registered only for names no package
 claimed. Where several packages export the same name the lexicographically first path wins, so
 runs are reproducible.
+
+### Texture identity
+
+**An asset name is not unique across a project.** `T_Statue_M` exists in both `Sci_Fi_SpaceShio/`
+and `StarterContent/` with different pixels, and there are seven such names in the sample project.
+Textures are therefore identified by **package path** (`/Game/Sci_Fi_SpaceShio/Textures/T_Statue_M`),
+which is what keys `texture_cache` and `tex_name_map`:
+
+- `scene.py` resolves a texture reference with `_texture_reference`, which walks the import's outer
+  chain to the `Package` import naming it (`_import_package_path`). A same-package reference has no
+  path, so it falls back to the object name.
+- `cli.py` derives each texture file's own path with `package_path_for_file` — a project's
+  `Content/` is mounted at `/Game/`.
+- `tex_name_map` registers the package path always, and the bare asset name **only when exactly one
+  texture has it**. An ambiguous name resolves by path or not at all; guessing is what silently
+  swapped textures between assets.
+- PNGs still go to one flat folder, so `assign_texture_filenames` suffixes colliding stems
+  (`T_Statue_M.png`, `T_Statue_M_2.png`), ordered by package path so reruns match. Nothing reads
+  these back — GLBs embed their own pixels — so the suffix is cosmetic.
+
+The same ambiguity exists for *materials* (`MI_GrateMaterial` names four files) and is not yet
+handled: material lookup is still by name, resolved to the lexicographically first path.
 
 ## Project rules
 
