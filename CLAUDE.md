@@ -89,7 +89,7 @@ Everything lives in the `uasset/` package. Parsing pipeline, roughly:
 | `properties.py` | Property-tag parsing/skipping; handles both the UE4-style and the newer `PROPERTY_TAG_COMPLETE_TYPE_NAME` format. `skip_properties` for mesh/texture, `read_properties` for umap, `read_property_tag`/`end_property_tag`/`has_serialization_control_byte` for callers that walk tags themselves |
 | `mesh.py` | `StaticMesh.from_package`, FMeshDescription parsing, `export_glb` |
 | `texture.py` | `Texture2D.from_package` (FEditorBulkData source art, Oodle + optional `TSCF_UEDELTA` delta decode), `export_png` |
-| `scene.py` | Asset index (keyed by parsed export object name) and mesh → material → base-color texture resolution: parent-chain walk, `TextureParameterValues` overrides, master-material BaseColor expression graph |
+| `scene.py` | Asset index (keyed by parsed export object name) and mesh → material → base-color texture resolution: parent-chain walk, `TextureParameterValues` overrides, cross-package BaseColor expression graph, material layers |
 | `umap.py` | `.umap` level parsing: actors, transforms, static-mesh references, level instancing |
 | `transform.py` | UE `FRotator`/transform math → matrices for the renderer |
 | `preview_server.py` | stdlib `http.server` on port 3050; serves `preview.html`, a scene JSON, and files from `Export/Meshes` + `Export/Textures` |
@@ -106,17 +106,40 @@ missing), then `scene.py` resolves that material to a base-color texture.
 collects two things:
 
 - the `TextureParameterValues` overrides declared at each level — nearest level wins;
-- the texture samplers the master Material's `BaseColor` input reads, found by a breadth-first walk
-  of the expression graph (`MaterialEditorOnlyData` → `BaseColor` → `Expression` → …). A sampler is
-  recognised by having a `Texture` ObjectProperty, so every `MaterialExpressionTextureSample*`
-  subclass is covered. Materials with `bUseMaterialAttributes` leave `BaseColor` unconnected, so
+- the texture samplers the base colour reads from, found by a breadth-first walk of the expression
+  graph (`MaterialEditorOnlyData` → `BaseColor` → `Expression` → …). A sampler is recognised by
+  having a `Texture` ObjectProperty, so every `MaterialExpressionTextureSample*` subclass is
+  covered. Materials with `bUseMaterialAttributes` leave `BaseColor` unconnected, so
   `MaterialAttributes` is searched too.
 
 Matching the two is what identifies the base colour: the master says *which parameter* feeds
 `BaseColor` (e.g. `BC`), the instance says *which texture* that parameter holds. Fallbacks, in
-order: the master's own default texture, a parameter named after a base-colour slot
+order: the graph's own default texture, a parameter named after a base-colour slot
 (`_BASE_COLOR_PARAM_NAMES` — only reachable when the master material lives outside the project,
 e.g. `/Engine/`), then any texture parameter at all.
+
+The graph walk (`_MaterialGraph`) crosses package boundaries. At a
+`MaterialExpressionMaterialFunctionCall` it opens the named `MaterialFunction` and continues from
+whatever that function returns — `MakeMaterialAttributes.BaseColor` if the function has one (layer
+functions do), otherwise its `FunctionOutput`/`MaterialLayerOutput` expressions. Engine functions
+aren't in the project, so they resolve to nothing and that branch simply stops. Expression inputs
+nested inside arrays of structs (`SetMaterialAttributes.Inputs`, `MaterialFunctionCall.FunctionInputs`)
+are unpacked rather than skipped.
+
+### Material Layers
+
+A layered master has a `MaterialExpressionMaterialAttributeLayers` node and no layers of its own —
+the *instance* supplies them via `StaticParametersRuntime.MaterialLayers.Layers`. Index 0 is the
+base layer; the rest are blended over it, so index 0 carries the base colour. A layer slot normally
+holds a layer **instance** (`MaterialFunctionMaterialLayerInstance`), which contributes parameter
+values but no graph — `Parent` is followed to the layer function, and the values collected on the
+way replace that function's defaults.
+
+Because a layered material reuses the same parameter name once per layer, overrides are keyed by
+`FMaterialParameterInfo` — `(Name, Association, Index)`, where `Association` is serialized as an
+FName (`GlobalParameter` / `LayerParameter` / `BlendParameter`). Keying by bare name silently
+returns whichever layer serialized last. A `LayerParameter` lookup never falls back to another
+layer's value for the same name; only `GlobalParameter` accepts a name-only match.
 
 Asset lookup goes through `_build_uasset_index`, which keys on the **object name of each `bIsAsset`
 export**, not the file name — `MI_SpaceShip_1.uasset` can contain an asset called `MI_SpaceShip`,

@@ -51,8 +51,30 @@ _EXPRESSION_INPUT_STRUCTS = frozenset({
     'SubstrateMaterialInput', 'MaterialAttributesInput',
 })
 
-# How many expression nodes a single BaseColor walk may visit.
-_MAX_EXPRESSION_NODES = 256
+# Expressions that stand in for the result of a material function: whatever
+# feeds these is what the function returns to its caller.
+_FUNCTION_OUTPUT_CLASSES = frozenset({
+    'MaterialExpressionFunctionOutput',
+    'MaterialExpressionMaterialLayerOutput',
+})
+
+# EMaterialParameterAssociation, as serialized in FMaterialParameterInfo.
+_GLOBAL_PARAMETER = 'GlobalParameter'
+_LAYER_PARAMETER = 'LayerParameter'
+
+# Exports that carry parameter overrides for something else's graph.
+_PARAMETER_OWNER_CLASSES = frozenset({
+    'MaterialInstanceConstant',
+    'MaterialFunctionMaterialLayerInstance',
+    'MaterialFunctionMaterialLayerBlendInstance',
+})
+
+# How many expression nodes one base-colour search may visit, across every
+# package it follows into.
+_MAX_EXPRESSION_NODES = 512
+
+# How deep a chain of material functions calling material functions may go.
+_MAX_FUNCTION_DEPTH = 8
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +91,10 @@ TaggedProperty = Tuple[PropertyTag, bytes]
 # A texture sampler in a material graph: the parameter name it exposes (if it
 # is a parameter at all) and the texture it samples by default.
 Sampler = Tuple[Optional[str], Optional[str]]
+
+# How FMaterialParameterInfo identifies a parameter override: its name, which
+# kind of slot it belongs to, and — for layer parameters — which layer.
+ParameterKey = Tuple[str, str, int]
 
 
 def _read_tagged_block(reader: BinaryReader, name_map: List[str],
@@ -159,11 +185,33 @@ def _iter_struct_array(pkg: Package, value: bytes):
         yield element
 
 
+def _iter_object_array(pkg: Package, value: bytes) -> List[int]:
+    """Read an array of ObjectProperty values as FPackageIndex ints.
+
+    Unlike an array of structs this carries no inner FPropertyTag in any
+    version — the count is followed straight by the indices.
+    """
+    r = BinaryReader(value)
+    try:
+        count = r.read_int32()
+        return [r.read_int32() for _ in range(count)]
+    except Exception:
+        return []
+
+
+def _read_fname_value(pkg: Package, value: bytes) -> Optional[str]:
+    """Resolve a property value that holds an FName."""
+    idx = _read_int32(value)
+    if idx is None or not 0 <= idx < len(pkg.name_map):
+        return None
+    return pkg.name_map[idx]
+
+
 def _find_material_instance_export(pkg: Package) -> Optional[int]:
     """Index of the MaterialInstanceConstant export, if the package has one.
 
     Master Materials do not, which is how the callers tell the two apart —
-    only instances carry parameter overrides and a parent.
+    only instances carry a parent and a layer stack.
     """
     for i in range(pkg.export_count):
         if pkg.get_export_class_name(i) == 'MaterialInstanceConstant':
@@ -171,27 +219,71 @@ def _find_material_instance_export(pkg: Package) -> Optional[int]:
     return None
 
 
-def _parameter_info_name(pkg: Package, element: List[TaggedProperty]
-                         ) -> Optional[str]:
-    """Read ``ParameterInfo.Name`` out of an F*ParameterValue element."""
+def _find_parameter_export(pkg: Package) -> Optional[int]:
+    """Index of the export holding parameter overrides, if there is one.
+
+    Material instances are not the only thing that carries them: a material
+    layer is normally used through a layer *instance*, which supplies values
+    for the layer function's parameters the same way.
+    """
+    for i in range(pkg.export_count):
+        if pkg.get_export_class_name(i) in _PARAMETER_OWNER_CLASSES:
+            return i
+    return None
+
+
+def _function_parent_name(pkg: Package) -> Optional[str]:
+    """The material function an instance of one derives from."""
+    index = _find_parameter_export(pkg)
+    if index is None:
+        return None
+    entry = _find_prop(_read_export_properties(pkg, index),
+                       'Parent', 'ObjectProperty')
+    if entry is None:
+        return None
+    return _resolve_package_index(pkg, _read_int32(entry[1]))
+
+
+def _parameter_info(pkg: Package, element: List[TaggedProperty]
+                    ) -> Optional[ParameterKey]:
+    """Read ``ParameterInfo`` out of an F*ParameterValue element.
+
+    A layered material reuses the same parameter name once per layer, so the
+    name alone does not identify an override — ``Association`` and ``Index``
+    say which layer it belongs to.
+    """
     info = _find_prop(element, 'ParameterInfo', 'StructProperty')
     if info is None:
         return None
     inner = _read_tagged_block(BinaryReader(info[1]), pkg.name_map,
                                pkg.file_version_ue5)
+
     entry = _find_prop(inner, 'Name', 'NameProperty')
-    if entry is None or len(entry[1]) < 8:
+    name = _read_fname_value(pkg, entry[1]) if entry is not None else None
+    if name is None:
         return None
-    idx = struct.unpack_from('<i', entry[1], 0)[0]
-    return pkg.name_map[idx] if 0 <= idx < len(pkg.name_map) else None
+
+    association = _GLOBAL_PARAMETER
+    entry = _find_prop(inner, 'Association')
+    if entry is not None:
+        # A ByteProperty backed by an enum stores the value as an FName.
+        resolved = (_read_fname_value(pkg, entry[1]) if len(entry[1]) >= 8
+                    else None)
+        if resolved is not None:
+            association = resolved
+
+    entry = _find_prop(inner, 'Index', 'IntProperty')
+    index = _read_int32(entry[1]) if entry is not None else 0
+
+    return name, association, index or 0
 
 
 def _parse_parameter_values(pkg: Package, array_name: str, value_type: str):
     """Parse one of the F*ParameterValue arrays of a material instance.
 
-    Yields ``(parameter_name, ParameterValue_bytes)`` pairs.
+    Yields ``(ParameterKey, ParameterValue_bytes)`` pairs.
     """
-    export_index = _find_material_instance_export(pkg)
+    export_index = _find_parameter_export(pkg)
     if export_index is None:
         return
     props = _read_export_properties(pkg, export_index)
@@ -199,24 +291,24 @@ def _parse_parameter_values(pkg: Package, array_name: str, value_type: str):
     if entry is None:
         return
     for element in _iter_struct_array(pkg, entry[1]):
-        name = _parameter_info_name(pkg, element)
+        key = _parameter_info(pkg, element)
         value = _find_prop(element, 'ParameterValue', value_type)
-        if name is not None and value is not None:
-            yield name, value[1]
+        if key is not None and value is not None:
+            yield key, value[1]
 
 
-def _parse_texture_parameter_values(pkg: Package) -> Dict[str, str]:
+def _parse_texture_parameter_values(pkg: Package) -> Dict[ParameterKey, str]:
     """Parse ``TextureParameterValues`` from a material instance package.
 
-    Returns ``{parameter_name: texture_asset_name}`` for every texture
+    Returns ``{parameter key: texture asset name}`` for every texture
     parameter override present in the material instance export data.
     """
-    result: Dict[str, str] = {}
-    for name, value in _parse_parameter_values(
+    result: Dict[ParameterKey, str] = {}
+    for key, value in _parse_parameter_values(
             pkg, 'TextureParameterValues', 'ObjectProperty'):
         texture = _resolve_package_index(pkg, _read_int32(value))
         if texture is not None:
-            result[name] = texture
+            result[key] = texture
     return result
 
 
@@ -227,11 +319,47 @@ def _parse_scalar_parameter_values(pkg: Package) -> Dict[str, float]:
     override present in the material instance export data.
     """
     result: Dict[str, float] = {}
-    for name, value in _parse_parameter_values(
+    for (name, _association, _index), value in _parse_parameter_values(
             pkg, 'ScalarParameterValues', 'FloatProperty'):
         if len(value) >= 4:
             result[name] = struct.unpack_from('<f', value, 0)[0]
     return result
+
+
+def _parse_material_layers(pkg: Package) -> List[str]:
+    """Return the material function names making up a layered instance.
+
+    A master Material with a ``MaterialAttributeLayers`` node holds no layers
+    itself — the instance supplies them through its static parameters.  Index
+    0 is the base layer; the rest are blended over it.
+    """
+    export_index = _find_material_instance_export(pkg)
+    if export_index is None:
+        return []
+
+    props = _read_export_properties(pkg, export_index)
+    entry = _find_prop(props, 'StaticParametersRuntime', 'StructProperty')
+    if entry is None:
+        return []
+
+    runtime = _read_tagged_block(BinaryReader(entry[1]), pkg.name_map,
+                                 pkg.file_version_ue5)
+    entry = _find_prop(runtime, 'MaterialLayers', 'StructProperty')
+    if entry is None:
+        return []
+
+    layers = _read_tagged_block(BinaryReader(entry[1]), pkg.name_map,
+                                pkg.file_version_ue5)
+    entry = _find_prop(layers, 'Layers', 'ArrayProperty')
+    if entry is None:
+        return []
+
+    names = []
+    for index in _iter_object_array(pkg, entry[1]):
+        name = _resolve_package_index(pkg, index)
+        if name is not None:
+            names.append(name)
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -390,53 +518,66 @@ def _get_base_color_texture_from_material(material_name: str,
     Returns:
         The resolved texture name from *tex_map*, or ``None``.
     """
-    overrides: Dict[str, str] = {}
+    graph = _MaterialGraph(uasset_index)
+    overrides: Dict[ParameterKey, str] = {}
     samplers: List[Sampler] = []
+    layers: List[str] = []
     visited = set()
     name: Optional[str] = material_name
 
     while name is not None and name not in visited and len(visited) <= 8:
         visited.add(name)
-        filepath = uasset_index.get(name)
-        if filepath is None:
-            break
-        try:
-            pkg = Package(filepath)
-        except Exception as e:
-            logger.debug(f"Failed to open material package for '{name}': {e}")
+        pkg = graph.package(name)
+        if pkg is None:
             break
 
-        for param_name, tex_asset_name in _parse_texture_parameter_values(pkg).items():
+        for key, tex_asset_name in _parse_texture_parameter_values(pkg).items():
             # The nearest instance in the chain wins.
-            overrides.setdefault(param_name, tex_asset_name)
+            overrides.setdefault(key, tex_asset_name)
+        if not layers:
+            layers = _parse_material_layers(pkg)
         if not samplers:
-            samplers = _get_base_color_samplers(pkg)
+            samplers = _get_base_color_samplers(pkg, graph)
         name = _find_parent_material_name(pkg, name)
+
+    # A layered material builds its base colour from stacked material layer
+    # functions rather than from the master's own graph.  Layer 0 is the base
+    # everything else is blended over, so that is the one that carries the
+    # material's base colour, and its parameters are the ones to match.
+    association, layer_index = _GLOBAL_PARAMETER, 0
+    if layers:
+        layer_samplers = _get_layer_base_color_samplers(layers[0], graph)
+        if layer_samplers:
+            samplers = layer_samplers
+            association = _LAYER_PARAMETER
+            logger.debug(f"Material '{material_name}': base layer "
+                         f"'{layers[0]}' of {len(layers)}")
 
     logger.debug(f"Material '{material_name}': overrides={overrides} "
                  f"base-color samplers={samplers}")
 
-    # 1. A sampler the BaseColor input reads from, overridden by the instance.
+    # 1. A sampler the base colour reads from, overridden by the instance.
     for param_name, _default in samplers:
-        override = overrides.get(param_name) if param_name else None
+        override = _lookup_override(overrides, param_name, association,
+                                    layer_index)
         mapped = _lookup_texture(tex_map, override) if override else None
         if mapped is not None:
-            logger.debug(f"  '{material_name}': BaseColor parameter "
-                         f"'{param_name}' → '{overrides[param_name]}'")
+            logger.debug(f"  '{material_name}': base colour parameter "
+                         f"'{param_name}' → '{override}'")
             return mapped
 
-    # 2. The texture the master material samples by default.
+    # 2. The texture the material graph samples by default.
     for _param_name, default in samplers:
         mapped = _lookup_texture(tex_map, default) if default else None
         if mapped is not None:
-            logger.debug(f"  '{material_name}': master-material BaseColor "
-                         f"default texture '{default}'")
+            logger.debug(f"  '{material_name}': base colour default "
+                         f"texture '{default}'")
             return mapped
 
     # 3. No usable graph — fall back to a parameter named like a base-colour
     #    slot, which is all there is to go on when the master material lives
     #    outside the project.
-    for param_name, tex_asset_name in overrides.items():
+    for (param_name, _assoc, _index), tex_asset_name in overrides.items():
         if param_name in _BASE_COLOR_PARAM_NAMES:
             mapped = _lookup_texture(tex_map, tex_asset_name)
             if mapped is not None:
@@ -445,7 +586,7 @@ def _get_base_color_texture_from_material(material_name: str,
                 return mapped
 
     # 4. Last resort: any texture parameter that maps into tex_map.
-    for param_name, tex_asset_name in overrides.items():
+    for (param_name, _assoc, _index), tex_asset_name in overrides.items():
         mapped = _lookup_texture(tex_map, tex_asset_name)
         if mapped is not None:
             logger.debug(f"  '{material_name}': fallback to first available "
@@ -455,7 +596,67 @@ def _get_base_color_texture_from_material(material_name: str,
     return None
 
 
-def _get_base_color_samplers(pkg: Package) -> List[Sampler]:
+def _lookup_override(overrides: Dict[ParameterKey, str],
+                     param_name: Optional[str], association: str,
+                     layer_index: int) -> Optional[str]:
+    """Find the instance override for one graph parameter.
+
+    A layer parameter belongs to exactly one layer, so another layer's value
+    for the same name is a different texture rather than a fallback.  Only an
+    unlayered material accepts a name-only match, where the leniency covers
+    parameters whose association was not recorded.
+    """
+    if param_name is None:
+        return None
+    exact = overrides.get((param_name, association, layer_index))
+    if exact is not None:
+        return exact
+    if association != _GLOBAL_PARAMETER:
+        return None
+    for (name, _assoc, _index), texture in overrides.items():
+        if name == param_name:
+            return texture
+    return None
+
+
+def _get_layer_base_color_samplers(layer_name: str,
+                                   graph: _MaterialGraph) -> List[Sampler]:
+    """Samplers feeding the base colour of one material layer.
+
+    A layer slot normally holds a layer *instance*, which contributes only
+    parameter values — the graph lives in the layer function it derives from,
+    so ``Parent`` is followed until one turns up.  The values collected on the
+    way replace the function's own defaults, since that is what the layer
+    actually samples.  The material instance can still override them again.
+    """
+    overrides: Dict[str, str] = {}
+    name: Optional[str] = layer_name
+    visited = set()
+
+    while name is not None and name not in visited and len(visited) <= _MAX_FUNCTION_DEPTH:
+        visited.add(name)
+        pkg = graph.package(name)
+        if pkg is None:
+            return []
+
+        for (param, _assoc, _index), texture in \
+                _parse_texture_parameter_values(pkg).items():
+            # The nearest layer instance in the chain wins.
+            overrides.setdefault(param, texture)
+
+        samplers = graph.function_samplers(pkg)
+        if samplers:
+            return [(param, overrides.get(param, default) if param else default)
+                    for param, default in samplers]
+
+        # No graph here — this is an instance of another layer function.
+        name = _function_parent_name(pkg)
+
+    return []
+
+
+def _get_base_color_samplers(pkg: Package,
+                             graph: _MaterialGraph) -> List[Sampler]:
     """List the texture samplers a master Material's BaseColor input reads.
 
     Walks the chain:
@@ -484,7 +685,7 @@ def _get_base_color_samplers(pkg: Package) -> List[Sampler]:
         if entry is None or entry[0].struct_name not in _EXPRESSION_INPUT_STRUCTS:
             continue
         # FMaterialInput opens with the Expression FPackageIndex.
-        samplers = _collect_samplers(pkg, _read_int32(entry[1]))
+        samplers = graph.samplers_from(pkg, _read_int32(entry[1]))
         if samplers:
             return samplers
 
@@ -526,40 +727,143 @@ def _read_sampler(pkg: Package,
     return parameter, texture
 
 
-def _collect_samplers(pkg: Package, root: Optional[int]) -> List[Sampler]:
-    """Breadth-first search from a material input for texture samplers.
+class _MaterialGraph:
+    """Breadth-first search for texture samplers across material packages.
 
     A base-colour input rarely points straight at a sampler — tint multiplies
-    and blend lerps sit in between, and a blend reads more than one texture.
-    Searching breadth-first returns them ordered by distance from the material
-    output.  Evaluating the graph is out of scope; this only locates textures.
+    and blend lerps sit in between, a blend reads more than one texture, and
+    the sampler itself often lives in a material function in another package.
+    Searching breadth-first returns samplers ordered by distance from the
+    material output.  Evaluating the graph is out of scope; this only locates
+    textures.
+
+    One instance per resolution, so packages opened along the way are read
+    once however many times the walk revisits them.
     """
-    queue = deque([root])
-    visited = set()
-    samplers: List[Sampler] = []
 
-    while queue and len(visited) < _MAX_EXPRESSION_NODES:
-        index = queue.popleft()
-        # Expressions are exports of the material package; a non-positive
-        # index means the input is unconnected or refers elsewhere.
-        if not index or index <= 0 or index in visited:
-            continue
-        visited.add(index)
+    def __init__(self, uasset_index: Dict[str, str]):
+        self._index = uasset_index
+        self._packages: Dict[str, Optional[Package]] = {}
 
-        exp_idx = index - 1
-        if not 0 <= exp_idx < len(pkg.exports):
-            continue
+    def package(self, asset_name: Optional[str]) -> Optional[Package]:
+        """Open the package providing *asset_name*, or None if unavailable.
 
-        props = _read_export_properties(pkg, exp_idx)
+        Engine content is not part of the project, so its material functions
+        simply resolve to None and that branch of the walk stops.
+        """
+        if asset_name is None:
+            return None
+        if asset_name not in self._packages:
+            filepath = self._index.get(asset_name)
+            package = None
+            if filepath is not None:
+                try:
+                    package = Package(filepath)
+                except Exception as e:
+                    logger.debug(f"Failed to open '{asset_name}': {e}")
+            self._packages[asset_name] = package
+        return self._packages[asset_name]
 
-        sampler = _read_sampler(pkg, props)
-        if sampler is not None:
-            samplers.append(sampler)
+    def samplers_from(self, pkg: Package, root: Optional[int]) -> List[Sampler]:
+        """Collect the samplers reachable from one expression input."""
+        return self._search(deque([(pkg, root, 0)]))
 
-        for tag, value in props:
-            if (tag.type_name == 'StructProperty'
-                    and tag.struct_name in _EXPRESSION_INPUT_STRUCTS):
-                queue.append(_read_int32(value))
+    def function_samplers(self, pkg: Package, depth: int = 0) -> List[Sampler]:
+        """Collect the samplers a material function's base colour reads."""
+        return self._search(deque(
+            (pkg, root, depth) for root in _function_base_color_roots(pkg)))
 
-    return samplers
+    def _search(self, queue) -> List[Sampler]:
+        visited = set()
+        samplers: List[Sampler] = []
+
+        while queue and len(visited) < _MAX_EXPRESSION_NODES:
+            pkg, index, depth = queue.popleft()
+            # Expressions are exports of their own package; a non-positive
+            # index means the input is unconnected or refers elsewhere.
+            if not index or index <= 0:
+                continue
+            step = (pkg.filepath, index)
+            if step in visited:
+                continue
+            visited.add(step)
+
+            exp_idx = index - 1
+            if not 0 <= exp_idx < len(pkg.exports):
+                continue
+
+            props = _read_export_properties(pkg, exp_idx)
+
+            sampler = _read_sampler(pkg, props)
+            if sampler is not None:
+                samplers.append(sampler)
+
+            # A function call continues the search inside the function it
+            # names, starting from whatever that function outputs.
+            if depth < _MAX_FUNCTION_DEPTH:
+                called = self._called_function(pkg, props)
+                if called is not None:
+                    for root in _function_base_color_roots(called):
+                        queue.append((called, root, depth + 1))
+
+            for expression in _expression_inputs(pkg, props):
+                queue.append((pkg, expression, depth))
+
+        return samplers
+
+    def _called_function(self, pkg: Package,
+                         props: List[TaggedProperty]) -> Optional[Package]:
+        """The package of the material function this expression calls."""
+        entry = _find_prop(props, 'MaterialFunction', 'ObjectProperty')
+        if entry is None:
+            return None
+        return self.package(_resolve_package_index(pkg, _read_int32(entry[1])))
+
+
+def _expression_inputs(pkg: Package,
+                       props: List[TaggedProperty]) -> List[Optional[int]]:
+    """Every expression an node's inputs point at.
+
+    Inputs also hide inside arrays of structs — ``SetMaterialAttributes.Inputs``
+    and ``MaterialFunctionCall.FunctionInputs`` both work that way — so those
+    are unpacked rather than skipped.
+    """
+    inputs: List[Optional[int]] = []
+    for tag, value in props:
+        if tag.type_name == 'StructProperty':
+            if tag.struct_name in _EXPRESSION_INPUT_STRUCTS:
+                inputs.append(_read_int32(value))
+        elif tag.type_name == 'ArrayProperty' and 'StructProperty' in tag.inner_types:
+            for element in _iter_struct_array(pkg, value):
+                for inner, inner_value in element:
+                    if (inner.type_name == 'StructProperty'
+                            and inner.struct_name in _EXPRESSION_INPUT_STRUCTS):
+                        inputs.append(_read_int32(inner_value))
+    return inputs
+
+
+def _function_base_color_roots(pkg: Package) -> List[int]:
+    """Where to start searching a material function for its base colour.
+
+    A layer function assembles its result with MakeMaterialAttributes, whose
+    BaseColor input names the base colour exactly.  Plain functions have no
+    such node, so their output expressions are used instead and the search
+    covers everything they return.
+    """
+    roots: List[int] = []
+    outputs: List[int] = []
+
+    for i in range(pkg.export_count):
+        class_name = pkg.get_export_class_name(i)
+        if class_name == 'MaterialExpressionMakeMaterialAttributes':
+            entry = _find_prop(_read_export_properties(pkg, i),
+                               'BaseColor', 'StructProperty')
+            if entry is not None:
+                index = _read_int32(entry[1])
+                if index:
+                    roots.append(index)
+        elif class_name in _FUNCTION_OUTPUT_CLASSES:
+            outputs.append(i + 1)
+
+    return roots or outputs
 
