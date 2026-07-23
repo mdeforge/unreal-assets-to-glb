@@ -249,6 +249,51 @@ def _extract_world_asset_path(world_asset_value, pkg: Package) -> str:
     return path
 
 
+def _split_content_path(filepath: str) -> Optional[Tuple[str, List[str]]]:
+    """Split a package path into its ``Content`` root and the parts below it.
+
+    Returns ``(content_root, ['Sci_Fi_SpaceShio', 'Levels', 'MainLevel.umap'])``
+    or None when the file does not sit under a Content directory.
+    """
+    parts = os.path.normpath(os.path.abspath(filepath)).replace('\\', '/').split('/')
+    for idx, part in enumerate(parts):
+        if part.lower() == 'content':
+            below = parts[idx + 1:]
+            return '/'.join(parts[:idx + 1]), below
+    return None
+
+
+def _find_external_actor_packages(umap_path: str) -> List[str]:
+    """Packages holding a World Partition level's actors.
+
+    A World Partition level keeps each actor in its own package under
+    ``Content/__ExternalActors__/<level path>/``, which leaves the ``.umap``
+    itself almost empty — parsing only the map yields no actors at all.
+    Returns the packages sorted, so a level always assembles in the same
+    order.
+    """
+    split = _split_content_path(umap_path)
+    if split is None:
+        return []
+    content_root, below = split
+    if not below:
+        return []
+
+    below = list(below)
+    below[-1] = os.path.splitext(below[-1])[0]
+    actors_dir = os.path.join(content_root, '__ExternalActors__', *below)
+    if not os.path.isdir(actors_dir):
+        return []
+
+    packages = []
+    for root, _dirs, files in os.walk(actors_dir):
+        for f in files:
+            if f.endswith('.uasset'):
+                packages.append(os.path.join(root, f))
+    packages.sort()
+    return packages
+
+
 def _resolve_umap_filesystem_path(asset_path: str, current_umap_path: str) -> str:
     """Convert a UE asset path to a filesystem path.
 
@@ -574,6 +619,25 @@ def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
                     _walk_composed_tree(child_idx, parent_name, depth + 1)
 
         _walk_composed_tree(root_comp_export_idx, actor_label)
+
+    # Phase 4.5: World Partition — the actors of this level live in their own
+    # packages rather than in the map.  Each one holds a complete actor with
+    # its components, so the same parsing applies; the transform of this level
+    # is applied to them below along with the map's own actors.
+    for ext_path in _find_external_actor_packages(filepath):
+        ext_abs = os.path.normpath(os.path.abspath(ext_path))
+        if ext_abs in _visited:
+            continue
+        try:
+            ext_level = parse_level(ext_path, None, _visited, _depth + 1)
+        except Exception as exc:
+            print(f"[umap] Failed to parse external actor {ext_path}: {exc}")
+            continue
+        actors.extend(ext_level.actors)
+        if not has_camera and ext_level.has_camera:
+            camera_location = ext_level.camera_location
+            camera_rotation = ext_level.camera_rotation
+            has_camera = True
 
     # Phase 5: Process LevelInstance actors (recursive sub-levels).
     # Record how many actors came from this level before recursing.

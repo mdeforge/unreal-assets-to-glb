@@ -22,10 +22,11 @@ import sys
 import json
 import traceback
 from collections import Counter
+import numpy as np
 from tqdm import tqdm
 
 from uasset.package import Package
-from uasset.mesh import StaticMesh, export_glb
+from uasset.mesh import StaticMesh, export_glb, _UE_TO_GLTF_SCALE
 import pickle
 import hashlib
 from uasset.texture import Texture2D, export_png
@@ -112,12 +113,84 @@ def assign_texture_filenames(textures):
     return stems
 
 
-def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None):
+def resolve_mesh_textures(mesh, name, uasset_index, tex_name_map, texture_cache):
+    """Resolve a base-colour texture for each of a mesh's polygon groups.
+
+    Each polygon group carries an ``ImportedMaterialSlotName`` which maps to a
+    concrete material through the ``StaticMaterials`` array, via
+    ``SectionInfoMap``.  Where that data is missing the polygon group index is
+    assumed to be the material import index.
+
+    Returns ``[(material_index, pixels, texture_key), ...]``.  The key is the
+    texture's package path, which lets a level GLB embed shared textures once
+    instead of once per mesh that uses them.
+    """
+    mesh_textures = []
+
+    if mesh.material_slots and mesh.material_slot_names:
+        section_map = getattr(mesh, 'section_info_map', None)
+        for pg_idx, slot_name in enumerate(mesh.material_slot_names):
+            if slot_name is None:
+                continue
+            # Resolve pg_idx → material slot index
+            slot_idx = (section_map[pg_idx]
+                        if section_map and pg_idx < len(section_map)
+                        else pg_idx)
+            if slot_idx < len(mesh.material_slots):
+                mat_name = mesh.material_slots[slot_idx][1]
+            else:
+                mat_name = None
+            if mat_name is None:
+                continue
+            tex_name = _get_base_color_texture_from_material(
+                mat_name, uasset_index, tex_name_map)
+            if tex_name and tex_name in texture_cache:
+                mesh_textures.append(
+                    (pg_idx, texture_cache[tex_name], tex_name))
+    else:
+        material_names = _get_material_names_from_mesh(name, uasset_index)
+        for mat_idx, mat_name in enumerate(material_names):
+            tex_name = _get_base_color_texture_from_material(
+                mat_name, uasset_index, tex_name_map)
+            if tex_name and tex_name in texture_cache:
+                mesh_textures.append(
+                    (mat_idx, texture_cache[tex_name], tex_name))
+
+    return mesh_textures
+
+
+class ExportContext:
+    """What a level export needs from the asset pass that precedes it."""
+
+    __slots__ = ('input_dir', 'meshes', 'uasset_index', 'texture_cache',
+                 'tex_name_map')
+
+    def __init__(self, input_dir, meshes, uasset_index, texture_cache,
+                 tex_name_map):
+        self.input_dir = input_dir
+        self.meshes = meshes                # [(filepath, name), ...]
+        self.uasset_index = uasset_index
+        self.texture_cache = texture_cache
+        self.tex_name_map = tex_name_map
+
+    def mesh_path(self, mesh_name):
+        """The .uasset providing *mesh_name*, or None."""
+        for filepath, name in self.meshes:
+            if name == mesh_name:
+                return filepath
+        return self.uasset_index.get(mesh_name)
+
+
+def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None,
+                   skip_meshes=False, scale=_UE_TO_GLTF_SCALE):
     """Find and export all meshes as GLB and base color textures as PNG.
 
     Args:
         mesh_filter: If set, only export meshes whose name contains this
             substring (case-insensitive).  Textures are still fully cached.
+        skip_meshes: Prepare the asset index and texture cache without writing
+            per-mesh GLBs — what a level export on its own needs.
+        scale: UE-unit → glTF-unit factor passed to the GLB writer.
     """
     os.makedirs(os.path.join(export_dir, "Meshes"), exist_ok=True)
     os.makedirs(os.path.join(export_dir, "Textures"), exist_ok=True)
@@ -235,7 +308,10 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
     # ------------------------------------------------------------------
     # Export meshes as GLB with embedded textures
     # ------------------------------------------------------------------
-    if mesh_filter:
+    if skip_meshes:
+        meshes_to_export = []
+        print("  (per-mesh GLB export skipped)")
+    elif mesh_filter:
         filtered = [(fp, n) for fp, n in meshes
                     if mesh_filter.lower() in n.lower()]
         print(f"Mesh filter '{mesh_filter}': {len(filtered)} of {len(meshes)} meshes match")
@@ -249,58 +325,103 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
             pkg = Package(filepath)
             mesh = StaticMesh.from_package(pkg)
             if mesh and mesh.vertices:
-                # Resolve textures for each polygon group via the real
-                # material-slot mapping parsed from the StaticMaterials
-                # export property.  Each polygon group has an
-                # ImportedMaterialSlotName which maps to a concrete material
-                # import name through the StaticMaterials array.
-                mesh_textures = []
-
-                if mesh.material_slots and mesh.material_slot_names:
-                    # Real data path: material_slots is an ordered list of
-                    # (slot_name, material_name) indexed by StaticMaterials
-                    # slot index.  Use SectionInfoMap to map each polygon
-                    # group to the correct material slot index.
-                    section_map = getattr(mesh, 'section_info_map', None)
-                    for pg_idx, slot_name in enumerate(mesh.material_slot_names):
-                        if slot_name is None:
-                            continue
-                        # Resolve pg_idx → material slot index
-                        slot_idx = (section_map[pg_idx]
-                                    if section_map and pg_idx < len(section_map)
-                                    else pg_idx)
-                        if slot_idx < len(mesh.material_slots):
-                            mat_name = mesh.material_slots[slot_idx][1]
-                        else:
-                            mat_name = None
-                        if mat_name is None:
-                            continue
-                        tex_name = _get_base_color_texture_from_material(
-                            mat_name, uasset_index, tex_name_map)
-                        if tex_name and tex_name in texture_cache:
-                            mesh_textures.append(
-                                (pg_idx, texture_cache[tex_name]))
-                else:
-                    # Fallback: no StaticMaterials data — assume polygon
-                    # group index == material import index.
-                    material_names = _get_material_names_from_mesh(
-                        name, uasset_index)
-                    for mat_idx, mat_name in enumerate(material_names):
-                        tex_name = _get_base_color_texture_from_material(
-                            mat_name, uasset_index, tex_name_map)
-                        if tex_name and tex_name in texture_cache:
-                            mesh_textures.append(
-                                (mat_idx, texture_cache[tex_name]))
-
+                mesh_textures = resolve_mesh_textures(
+                    mesh, name, uasset_index, tex_name_map, texture_cache)
                 glb_path = os.path.join(export_dir, "Meshes", f"{name}.glb")
                 export_glb(mesh, glb_path,
-                           textures=mesh_textures if mesh_textures else None)
+                           textures=mesh_textures if mesh_textures else None,
+                           scale=scale)
                 mesh_success += 1
         except Exception as e:
             tqdm.write(f"  {name}: ERROR {e}")
 
     print(f"Export complete: {mesh_success} meshes, {tex_success} textures")
-    return mesh_success, tex_success
+    return ExportContext(input_dir, meshes, uasset_index, texture_cache,
+                         tex_name_map)
+
+
+def export_level(input_dir, export_dir, umap_filename, context,
+                 scale=_UE_TO_GLTF_SCALE):
+    """Assemble one level's actors into a single positioned GLB.
+
+    Args:
+        input_dir:     Project root.
+        export_dir:    Output directory; the level lands in ``Levels/``.
+        umap_filename: Level file name, e.g. ``MainLevel.umap``.
+        context:       :class:`ExportContext` from :func:`process_assets`.
+        scale:         UE-unit → glTF-unit factor.
+
+    Returns:
+        Output path, or None when nothing could be assembled.
+    """
+    from uasset.umap import parse_level
+    from uasset.mesh import export_level_glb
+    from uasset.transform import rotator_to_matrix
+
+    umap_path = find_umap_path(input_dir, umap_filename)
+    if not umap_path:
+        print(f"ERROR: Level file '{umap_filename}' not found in {input_dir}")
+        return None
+
+    level_name = os.path.splitext(os.path.basename(umap_path))[0]
+    print(f"\nAssembling level: {level_name}")
+    level = parse_level(umap_path)
+    if not level.actors:
+        print("  No placed actors found — nothing to assemble")
+        return None
+
+    wanted = sorted({a.mesh_name for a in level.actors if a.mesh_name})
+    print(f"  {len(level.actors)} placed actors, {len(wanted)} distinct meshes")
+
+    # Load each distinct mesh once, with the same textures the per-mesh GLBs get
+    meshes = {}
+    missing = []
+    for mesh_name in tqdm(wanted, desc="Loading meshes", unit="mesh"):
+        filepath = context.mesh_path(mesh_name)
+        if filepath is None:
+            missing.append(mesh_name)
+            continue
+        try:
+            mesh = StaticMesh.from_package(Package(filepath))
+            if mesh is None or not mesh.vertices:
+                missing.append(mesh_name)
+                continue
+            textures = resolve_mesh_textures(
+                mesh, mesh_name, context.uasset_index, context.tex_name_map,
+                context.texture_cache)
+            meshes[mesh_name] = (mesh, textures)
+        except Exception as e:
+            tqdm.write(f"  {mesh_name}: ERROR {e}")
+            missing.append(mesh_name)
+
+    if missing:
+        print(f"  {len(missing)} meshes unavailable, their actors are skipped: "
+              f"{', '.join(missing[:6])}{' …' if len(missing) > 6 else ''}")
+
+    # UE world transform per actor
+    placements = []
+    for actor in level.actors:
+        if actor.mesh_name not in meshes:
+            continue
+        matrix = np.eye(4)
+        matrix[:3, :3] = (rotator_to_matrix(*actor.world_rotation)
+                          * np.array(actor.world_scale)[np.newaxis, :])
+        matrix[:3, 3] = actor.world_location
+        placements.append((actor.name or actor.mesh_name,
+                           actor.mesh_name, matrix))
+
+    out_path = os.path.join(export_dir, "Levels", f"{level_name}.glb")
+    mesh_count, node_count = export_level_glb(meshes, placements, out_path,
+                                              scale=scale)
+    if not node_count:
+        print("  Nothing to write")
+        return None
+
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    print(f"  Wrote {out_path}")
+    print(f"  {mesh_count} meshes, {node_count} placed instances, "
+          f"{size_mb:.1f} MB")
+    return out_path
 
 
 def find_umap_path(input_dir, umap_filename):
@@ -362,7 +483,20 @@ def main():
         '--filter', metavar='SUBSTRING', dest='mesh_filter',
         help='Only export meshes whose name contains this substring (case-insensitive)'
     )
+    parser.add_argument(
+        '--export-level', metavar='LEVEL.umap',
+        help='Assemble the level into one positioned GLB in Export/Levels/'
+    )
+    parser.add_argument(
+        '--scale', type=float, default=_UE_TO_GLTF_SCALE,
+        help='UE-unit to glTF-unit scale (default %(default)s: UE centimetres '
+             'to glTF metres). Pass 1.0 to keep UE centimetres.'
+    )
     args = parser.parse_args()
+
+    if args.scale <= 0:
+        print(f"ERROR: --scale must be positive, got {args.scale}")
+        sys.exit(1)
 
     input_dir = os.path.abspath(args.input_dir)
     export_dir = os.path.abspath(args.export_dir)
@@ -381,11 +515,25 @@ def main():
     find_uproject(input_dir)
 
     # Export assets
+    context = None
     if not args.skip_export:
-        process_assets(input_dir, export_dir, skip_textures=args.skip_textures,
-                       mesh_filter=args.mesh_filter)
+        context = process_assets(input_dir, export_dir,
+                                 skip_textures=args.skip_textures,
+                                 mesh_filter=args.mesh_filter,
+                                 scale=args.scale)
     else:
         print("Skipping export (using existing Export/ directory)")
+
+    # Assemble a level into one positioned GLB
+    if args.export_level:
+        if context is None:
+            # --skip-export still needs the asset index and texture pixels;
+            # the pickle cache makes this cheap on a second run.
+            context = process_assets(input_dir, export_dir,
+                                     skip_textures=True, skip_meshes=True,
+                                     scale=args.scale)
+        export_level(input_dir, export_dir, args.export_level, context,
+                     scale=args.scale)
 
     # Preview if requested
     if args.preview:
