@@ -65,6 +65,13 @@ def decompress_compressed_buffer(data: bytes) -> Optional[bytes]:
     total_raw_size = _be_uint64(data, 16)
     block_size = 1 << block_size_exp if block_size_exp > 0 else 0
 
+    # EMethod::None — the payload follows the 64-byte header verbatim and
+    # there is no block-size table.  UE stores source art that is already an
+    # encoded image (PNG/JPEG) this way, since re-compressing it is pointless.
+    if method == 0:
+        raw = data[64:64 + total_raw_size]
+        return raw if len(raw) == total_raw_size else None
+
     # Parse block sizes (big-endian uint32 array after 64-byte header)
     block_sizes_offset = 64
     block_sizes = []
