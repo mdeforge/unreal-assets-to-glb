@@ -59,6 +59,130 @@ def _read_property_type_tree(r: BinaryReader, name_map):
 
 
 # ---------------------------------------------------------------------------
+# FPropertyTag header reader (version-aware)
+# ---------------------------------------------------------------------------
+
+def has_serialization_control_byte(file_version_ue5: int) -> bool:
+    """Whether export data starts with a serialization-control byte.
+
+    UE5 writes this byte ahead of the tagged-property block from
+    PROPERTY_TAG_EXTENSION onwards.  Older packages — including engine content
+    such as StarterContent — begin directly with the first FPropertyTag.
+    """
+    return file_version_ue5 >= UE5_PROPERTY_TAG_EXTENSION
+
+
+class PropertyTag:
+    """One FPropertyTag header, parsed in either the UE4 or the UE5 layout."""
+
+    __slots__ = ('name', 'type_name', 'inner_types', 'size', 'flags',
+                 'array_index', 'bool_value', 'new_format')
+
+    def __init__(self, name, type_name, inner_types, size, flags,
+                 array_index, bool_value, new_format):
+        self.name = name
+        self.type_name = type_name
+        self.inner_types = inner_types
+        self.size = size
+        self.flags = flags
+        self.array_index = array_index
+        self.bool_value = bool_value
+        self.new_format = new_format
+
+    @property
+    def struct_name(self) -> str:
+        """Inner struct/enum type name, or "" when the tag carries none."""
+        return self.inner_types[0] if self.inner_types else ""
+
+
+def read_property_tag(reader: BinaryReader, name_map,
+                      file_version_ue5: int):
+    """Read the next FPropertyTag header.
+
+    Returns None at the ``None`` terminator or when the stream is exhausted.
+    On success the reader is left at the first byte of the value data, so the
+    caller can parse it or ``skip(tag.size)``.  Call :func:`end_property_tag`
+    once the value has been consumed.
+
+    Reads the same byte sequences as :func:`skip_properties`, but hands the tag
+    back instead of discarding it.
+    """
+    if not reader.can_read(8):
+        return None
+
+    name_idx = reader.read_int32()
+    _name_num = reader.read_int32()
+    name = name_map[name_idx] if 0 <= name_idx < len(name_map) else f"#{name_idx}"
+    if name == "None":
+        return None
+
+    if file_version_ue5 >= UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME:
+        # New format: FPropertyTypeName tree + Size + Flags byte
+        type_name, inner_types = _read_property_type_tree(reader, name_map)
+        size = reader.read_int32()
+        flags = reader.read_uint8()
+        array_index = reader.read_int32() if flags & TAG_HasArrayIndex else 0
+        return PropertyTag(name, type_name, inner_types, size, flags,
+                           array_index, bool(flags & TAG_BoolTrue), True)
+
+    # Old format: FName type + Size + ArrayIndex + type-specific header, with
+    # HasPropertyGuid ahead of the value data rather than after it.
+    type_idx = reader.read_int32()
+    _type_num = reader.read_int32()
+    type_name = name_map[type_idx] if 0 <= type_idx < len(name_map) else f"#{type_idx}"
+
+    size = reader.read_int32()
+    array_index = reader.read_int32()
+
+    inner_types = []
+    bool_value = False
+    if type_name == "StructProperty":
+        struct_idx = reader.read_int32()
+        _struct_num = reader.read_int32()
+        inner_types = [name_map[struct_idx] if 0 <= struct_idx < len(name_map)
+                       else f"#{struct_idx}"]
+        reader.skip(16)  # StructGuid
+    elif type_name == "BoolProperty":
+        bool_value = reader.read_uint8() != 0
+    elif type_name in ("ByteProperty", "EnumProperty"):
+        enum_idx = reader.read_int32()
+        _enum_num = reader.read_int32()
+        inner_types = [name_map[enum_idx] if 0 <= enum_idx < len(name_map)
+                       else f"#{enum_idx}"]
+    elif type_name in ("ArrayProperty", "SetProperty"):
+        reader.skip(8)   # InnerType FName
+    elif type_name == "MapProperty":
+        reader.skip(16)  # InnerType + ValueType FNames
+
+    if reader.read_uint8():
+        reader.skip(16)  # PropertyGuid
+
+    return PropertyTag(name, type_name, inner_types, size,
+                       TAG_BoolTrue if bool_value else 0,
+                       array_index, bool_value, False)
+
+
+def end_property_tag(reader: BinaryReader, tag: PropertyTag,
+                     file_version_ue5: int) -> None:
+    """Consume the tag bytes that trail the value data.
+
+    Only the new format puts anything after the value; the old format's
+    property GUID is already consumed by :func:`read_property_tag`.
+    """
+    if not tag.new_format:
+        return
+
+    if tag.flags & TAG_HasPropertyGuid:
+        reader.skip(16)
+
+    if (file_version_ue5 >= UE5_PROPERTY_TAG_EXTENSION
+            and tag.flags & TAG_HasPropertyExtensions):
+        ext = reader.read_uint8()
+        if ext & 0x01:  # OverridableInformation
+            reader.skip(1 + 4)  # OverrideOperation + bExperimentalOverridableLogic
+
+
+# ---------------------------------------------------------------------------
 # Struct value readers
 # ---------------------------------------------------------------------------
 
