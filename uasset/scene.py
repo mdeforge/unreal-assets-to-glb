@@ -163,6 +163,59 @@ def _resolve_package_index(pkg: Package, index: Optional[int]) -> Optional[str]:
     return None
 
 
+def _import_package_path(pkg: Package, index: Optional[int]) -> Optional[str]:
+    """The ``/Game/...`` path of the package an import lives in.
+
+    An import's outer chain ends at the Package import naming it, which is
+    what distinguishes two assets that share a name.
+    """
+    if index is None or index >= 0:
+        return None
+    for _ in range(16):
+        imp_idx = -index - 1
+        if not 0 <= imp_idx < len(pkg.imports):
+            return None
+        imp = pkg.imports[imp_idx]
+        if imp.class_name == 'Package':
+            return imp.object_name
+        index = imp.outer_index
+        if index >= 0:
+            return None
+    return None
+
+
+def _texture_reference(pkg: Package, index: Optional[int]) -> Optional[str]:
+    """How a texture reference is identified downstream.
+
+    The package path where the reference carries one, since asset names are
+    not unique across a project — ``T_Statue_M`` exists twice in StarterContent
+    alone.  Falls back to the bare object name, which is all a same-package
+    reference has.
+    """
+    return (_import_package_path(pkg, index)
+            or _resolve_package_index(pkg, index))
+
+
+def package_path_for_file(input_dir: str, filepath: str) -> Optional[str]:
+    """The ``/Game/...`` path UE knows a package file by.
+
+    A project's ``Content/`` directory is mounted at ``/Game/``, so the path
+    follows from the file's location beneath it.  Returns None for anything
+    outside that tree.
+    """
+    content_dir = os.path.join(input_dir, 'Content')
+    if not os.path.isdir(content_dir):
+        content_dir = input_dir
+    try:
+        relative = os.path.relpath(filepath, content_dir)
+    except ValueError:
+        return None      # different drive on Windows
+    if relative.startswith(os.pardir):
+        return None
+    relative = os.path.splitext(relative)[0].replace(os.sep, '/')
+    return f"/Game/{relative}"
+
+
 def _iter_struct_array(pkg: Package, value: bytes):
     """Yield the tagged properties of each element of an array-of-struct value.
 
@@ -300,13 +353,13 @@ def _parse_parameter_values(pkg: Package, array_name: str, value_type: str):
 def _parse_texture_parameter_values(pkg: Package) -> Dict[ParameterKey, str]:
     """Parse ``TextureParameterValues`` from a material instance package.
 
-    Returns ``{parameter key: texture asset name}`` for every texture
+    Returns ``{parameter key: texture reference}`` for every texture
     parameter override present in the material instance export data.
     """
     result: Dict[ParameterKey, str] = {}
     for key, value in _parse_parameter_values(
             pkg, 'TextureParameterValues', 'ObjectProperty'):
-        texture = _resolve_package_index(pkg, _read_int32(value))
+        texture = _texture_reference(pkg, _read_int32(value))
         if texture is not None:
             result[key] = texture
     return result
@@ -713,7 +766,7 @@ def _read_sampler(pkg: Package,
         imp_idx = -index - 1
         if (0 <= imp_idx < len(pkg.imports)
                 and pkg.imports[imp_idx].class_name == 'Texture2D'):
-            texture = pkg.imports[imp_idx].object_name
+            texture = _texture_reference(pkg, index)
 
     parameter = None
     named = _find_prop(props, 'ParameterName', 'NameProperty')

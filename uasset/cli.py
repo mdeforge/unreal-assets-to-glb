@@ -21,6 +21,7 @@ import os
 import sys
 import json
 import traceback
+from collections import Counter
 from tqdm import tqdm
 
 from uasset.package import Package
@@ -33,6 +34,7 @@ from uasset.scene import (
     _build_uasset_index,
     _get_material_names_from_mesh,
     _get_base_color_texture_from_material,
+    package_path_for_file,
 )
 
 
@@ -68,22 +70,46 @@ def find_uasset_files(input_dir):
 
 def classify_uasset(filepath, input_dir):
     """Determine asset type by parsing package header.
-    Returns: ('mesh', name) or ('texture', name) or ('material', name) or ('other', name)
+
+    Returns ``(kind, name, package_path)`` where *kind* is 'mesh', 'texture'
+    or 'other', *name* is the file stem used for output files, and
+    *package_path* is the ``/Game/...`` path that identifies the asset
+    uniquely — two folders can hold assets of the same name.
     """
+    name = os.path.splitext(os.path.basename(filepath))[0]
+    package_path = package_path_for_file(input_dir, filepath) or filepath
     try:
         pkg = Package(filepath)
         # Check exports for known types
         for i in range(pkg.export_count):
             class_name = pkg.get_export_class_name(i)
             if class_name == "StaticMesh":
-                name = os.path.splitext(os.path.basename(filepath))[0]
-                return 'mesh', name
+                return 'mesh', name, package_path
             elif class_name in ("Texture2D", "TextureCube", "VolumeTexture"):
-                name = os.path.splitext(os.path.basename(filepath))[0]
-                return 'texture', name
-        return 'other', os.path.splitext(os.path.basename(filepath))[0]
+                return 'texture', name, package_path
+        return 'other', name, package_path
     except Exception:
-        return 'other', os.path.splitext(os.path.basename(filepath))[0]
+        return 'other', name, package_path
+
+
+def assign_texture_filenames(textures):
+    """Give every texture a unique PNG stem.
+
+    Textures are identified by package path, but the PNGs are written to one
+    flat folder, so assets sharing a name need distinct file names or they
+    overwrite each other.  Sorted by package path so a rerun produces the
+    same assignment.
+    """
+    stems = {}
+    used = set()
+    for _filepath, name, package_path in sorted(textures, key=lambda t: t[2]):
+        stem, suffix = name, 2
+        while stem.lower() in used:
+            stem = f"{name}_{suffix}"
+            suffix += 1
+        used.add(stem.lower())
+        stems[package_path] = stem
+    return stems
 
 
 def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None):
@@ -104,11 +130,11 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
     others = []
 
     for filepath in uassets:
-        asset_type, name = classify_uasset(filepath, input_dir)
+        asset_type, name, package_path = classify_uasset(filepath, input_dir)
         if asset_type == 'mesh':
             meshes.append((filepath, name))
         elif asset_type == 'texture':
-            textures.append((filepath, name))
+            textures.append((filepath, name, package_path))
         else:
             others.append((filepath, name))
 
@@ -126,18 +152,23 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
     # Compute a quick fingerprint of the Input/ texture files
     def _input_fingerprint():
         h = hashlib.md5()
-        for fp, n in sorted(textures):
-            h.update(n.encode())
+        for fp, n, path in sorted(textures, key=lambda t: t[2]):
+            h.update(path.encode())
             h.update(str(os.path.getmtime(fp)).encode())
             h.update(str(os.path.getsize(fp)).encode())
         return h.hexdigest()
 
     tex_success = 0
-    texture_cache = {}  # texture_name -> numpy RGBA pixels
+    texture_cache = {}  # package path -> numpy RGBA pixels
     tex_name_map = {}
 
-    base_color_textures = [(fp, n) for fp, n in textures]  # export ALL textures
+    base_color_textures = list(textures)  # export ALL textures
+    png_stems = assign_texture_filenames(textures)
+    renamed = sum(1 for fp, n, path in textures if png_stems[path] != n)
     print(f"Textures to export: {len(base_color_textures)}")
+    if renamed:
+        print(f"  ({renamed} share an asset name with another texture and are "
+              f"written under a suffixed file name)")
 
     # Try loading from pickle cache
     fp_hash = _input_fingerprint()
@@ -155,15 +186,19 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
             pass  # Corrupt cache — rebuild
 
     if not cache_loaded:
-        for filepath, name in tqdm(sorted(base_color_textures), desc="Exporting textures", unit="tex"):
+        for filepath, name, package_path in tqdm(
+                sorted(base_color_textures, key=lambda t: t[2]),
+                desc="Exporting textures", unit="tex"):
             try:
                 pkg = Package(filepath)
                 texture = Texture2D.from_package(pkg)
                 if texture and texture.pixels is not None:
                     if not skip_textures:
-                        png_path = os.path.join(export_dir, "Textures", f"{name}.png")
+                        png_path = os.path.join(
+                            export_dir, "Textures",
+                            f"{png_stems[package_path]}.png")
                         export_png(texture, png_path)
-                    texture_cache[name] = texture.pixels
+                    texture_cache[package_path] = texture.pixels
                     tex_success += 1
             except Exception as e:
                 tqdm.write(f"  {name}: ERROR {e}")
@@ -179,8 +214,23 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
     if skip_textures:
         print(f"  (PNG file export skipped --skip-textures, {tex_success} textures cached for GLB)")
 
-    # Identity map so _get_base_color_texture_from_material returns the texture name
-    tex_name_map = {name: name for name in texture_cache}
+    # Lookup table for _get_base_color_texture_from_material, keyed by the
+    # package path a material's import table gives.  Bare asset names are
+    # registered too, for references that carry no path — but only where the
+    # name identifies exactly one texture, since resolving an ambiguous name
+    # is what silently swapped textures between assets before.
+    name_counts = Counter(name for _fp, name, _path in textures)
+    tex_name_map = {}
+    for _filepath, name, package_path in textures:
+        if package_path not in texture_cache:
+            continue
+        tex_name_map[package_path] = package_path
+        if name_counts[name] == 1:
+            tex_name_map[name] = package_path
+    ambiguous = sum(1 for n, c in name_counts.items() if c > 1)
+    if ambiguous:
+        print(f"  ({ambiguous} texture names are used by more than one asset "
+              f"and resolve by package path only)")
 
     # ------------------------------------------------------------------
     # Export meshes as GLB with embedded textures
