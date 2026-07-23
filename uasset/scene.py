@@ -4,10 +4,12 @@ Provides utilities to walk the UE asset import chain
 (mesh → material → texture) and resolve base-color textures
 for GLB export.  Used by main.py during the export pipeline.
 
-Texture resolution works by parsing ``TextureParameterValues`` from
-material instance export data and walking the parent chain
-(MI → parent MI → … → master Material) until a base-color
-parameter override is found.
+Texture resolution walks the parent chain (MI → parent MI → … → master
+Material), collecting the ``TextureParameterValues`` overrides each level
+declares and the texture samplers the master Material's BaseColor input
+reads from.  Matching the two is what identifies the base colour: the
+master says which parameter feeds BaseColor, the instance says which
+texture that parameter holds.
 
 Legacy preview code (MatplotlibPreviewer, PygletPreviewer, build_preview_scene,
 show_preview) has been removed in favour of the browser-based preview
@@ -16,9 +18,14 @@ show_preview) has been removed in favour of the browser-based preview
 import os
 import struct
 import logging
+from collections import deque
 from typing import Optional, Dict, List, Tuple
 
-from .package import Package
+from .package import Package, UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME
+from .properties import (
+    PropertyTag, end_property_tag, has_serialization_control_byte,
+    read_property_tag,
+)
 from .reader import BinaryReader
 
 logger = logging.getLogger(__name__)
@@ -34,240 +41,196 @@ _BASE_COLOR_PARAM_NAMES = frozenset({
     'Base Color', 'DiffuseTexture',
 })
 
+# Struct type names used for the links between material expression nodes.
+# FExpressionInput and the FMaterialInput<T> family all start with the
+# Expression FPackageIndex, so one walker handles them all.
+_EXPRESSION_INPUT_STRUCTS = frozenset({
+    'ExpressionInput', 'MaterialInput',
+    'ColorMaterialInput', 'ScalarMaterialInput', 'VectorMaterialInput',
+    'Vector2MaterialInput', 'ShadingModelMaterialInput',
+    'SubstrateMaterialInput', 'MaterialAttributesInput',
+})
+
+# How many expression nodes a single BaseColor walk may visit.
+_MAX_EXPRESSION_NODES = 256
+
+
 # ---------------------------------------------------------------------------
-# Low-level helpers for reading UE property headers from export data
+# Tagged-property helpers
+#
+# Every reader below goes through properties.read_property_tag, which picks
+# the UE4 or UE5 tag layout from the package version.  Parsing these blocks
+# by hand is what previously made all pre-5.4 packages (StarterContent) fail.
 # ---------------------------------------------------------------------------
 
-def _read_fname(r: BinaryReader, name_map: List[str]) -> str:
-    """Read an FName (index + number) and resolve to string."""
-    idx = r.read_int32()
-    _num = r.read_int32()
-    return name_map[idx] if 0 <= idx < len(name_map) else f"#{idx}"
+# One parsed property: its tag plus the raw bytes of its value.
+TaggedProperty = Tuple[PropertyTag, bytes]
+
+# A texture sampler in a material graph: the parameter name it exposes (if it
+# is a parameter at all) and the texture it samples by default.
+Sampler = Tuple[Optional[str], Optional[str]]
 
 
-def _read_type_tree(r: BinaryReader, name_map: List[str]) -> List[str]:
-    """Read the UE5 property type tree (used in property tags)."""
-    total_nodes = 1
-    names: List[str] = []
-    i = 0
-    while i < total_nodes:
-        idx = r.read_int32()
-        _num = r.read_int32()
-        inner_count = r.read_int32()
-        name = name_map[idx] if 0 <= idx < len(name_map) else f"#{idx}"
-        names.append(name)
-        total_nodes += inner_count
-        i += 1
-    return names
+def _read_tagged_block(reader: BinaryReader, name_map: List[str],
+                       file_version_ue5: int) -> List[TaggedProperty]:
+    """Read tagged properties up to the ``None`` terminator.
 
-
-def _skip_property_extensions(r: BinaryReader) -> None:
-    """Skip UE5 property extension data."""
-    flags = r.read_uint8()
-    if flags & 0x01:
-        r.skip(5)
-
-
-def _read_property_header(r: BinaryReader, name_map: List[str],
-                          use_extensions: bool
-                          ) -> Optional[Tuple[str, List[str], int, int]]:
-    """Read a UE5 property tag header.
-
-    Returns ``(name, type_names, size, flags)`` or ``None`` when the
-    sentinel ``None`` FName is reached (end of property list).
+    Returns a list rather than a dict because UE happily repeats a property
+    name across array indices (``CustomizedUVs`` and friends).
     """
-    name = _read_fname(r, name_map)
-    if name == 'None':
+    props: List[TaggedProperty] = []
+    while True:
+        try:
+            tag = read_property_tag(reader, name_map, file_version_ue5)
+            if tag is None:
+                break
+            if tag.size < 0:
+                break
+            value = reader.read_bytes(tag.size) if tag.size else b''
+            end_property_tag(reader, tag, file_version_ue5)
+        except Exception:
+            # Truncated or unexpected data — keep whatever parsed cleanly.
+            break
+        props.append((tag, value))
+    return props
+
+
+def _read_export_properties(pkg: Package,
+                            export_index: int) -> List[TaggedProperty]:
+    """Read the tagged properties at the head of an export's serialized data."""
+    reader = pkg.get_export_data(export_index)
+    if reader is None:
+        return []
+    if has_serialization_control_byte(pkg.file_version_ue5):
+        reader.skip(1)
+    return _read_tagged_block(reader, pkg.name_map, pkg.file_version_ue5)
+
+
+def _find_prop(props: List[TaggedProperty], name: str,
+               type_name: Optional[str] = None) -> Optional[TaggedProperty]:
+    """Return the first property called *name*, optionally of *type_name*."""
+    for tag, value in props:
+        if tag.name == name and (type_name is None or tag.type_name == type_name):
+            return tag, value
+    return None
+
+
+def _read_int32(value: bytes, offset: int = 0) -> Optional[int]:
+    """Read a little-endian int32 out of a property value blob."""
+    if len(value) < offset + 4:
         return None
-    type_names = _read_type_tree(r, name_map)
-    size = r.read_int32()
-    flags = r.read_uint8()
-    if flags & 0x01:   # HasArrayIndex
-        r.skip(4)
-    if flags & 0x02:   # HasPropertyGuid
-        r.skip(16)
-    if use_extensions and (flags & 0x04):
-        _skip_property_extensions(r)
-    return name, type_names, size, flags
+    return struct.unpack_from('<i', value, offset)[0]
 
 
-# ---------------------------------------------------------------------------
-# TextureParameterValues / ScalarParameterValues parser
-# ---------------------------------------------------------------------------
+def _resolve_package_index(pkg: Package, index: Optional[int]) -> Optional[str]:
+    """Resolve an FPackageIndex to the object name it points at."""
+    if not index:
+        return None
+    if index > 0:
+        exp_idx = index - 1
+        if 0 <= exp_idx < len(pkg.exports):
+            return pkg.exports[exp_idx].object_name
+    else:
+        imp_idx = -index - 1
+        if 0 <= imp_idx < len(pkg.imports):
+            return pkg.imports[imp_idx].object_name
+    return None
 
-def _find_property_offset(data: bytes, name_map: List[str],
-                          prop_name: str) -> int:
-    """Scan *data* for the FName of *prop_name* and return its byte offset.
 
-    The FName is encoded as ``<i index><i 0>``.  Returns ``-1`` if not
-    found.
+def _iter_struct_array(pkg: Package, value: bytes):
+    """Yield the tagged properties of each element of an array-of-struct value.
+
+    The element count is followed by the elements themselves, except before
+    PROPERTY_TAG_COMPLETE_TYPE_NAME, where UE writes one extra FPropertyTag
+    describing the element type first (the outer tag's type tree carries that
+    information from 5.4 on).
     """
+    r = BinaryReader(value)
     try:
-        name_idx = name_map.index(prop_name)
-    except ValueError:
-        return -1
-    target = struct.pack('<ii', name_idx, 0)
-    return data.find(target)
+        count = r.read_int32()
+        if pkg.file_version_ue5 < UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME:
+            read_property_tag(r, pkg.name_map, pkg.file_version_ue5)
+    except Exception:
+        return
+    for _ in range(count):
+        element = _read_tagged_block(r, pkg.name_map, pkg.file_version_ue5)
+        if not element:
+            return
+        yield element
+
+
+def _find_material_instance_export(pkg: Package) -> Optional[int]:
+    """Index of the MaterialInstanceConstant export, if the package has one.
+
+    Master Materials do not, which is how the callers tell the two apart —
+    only instances carry parameter overrides and a parent.
+    """
+    for i in range(pkg.export_count):
+        if pkg.get_export_class_name(i) == 'MaterialInstanceConstant':
+            return i
+    return None
+
+
+def _parameter_info_name(pkg: Package, element: List[TaggedProperty]
+                         ) -> Optional[str]:
+    """Read ``ParameterInfo.Name`` out of an F*ParameterValue element."""
+    info = _find_prop(element, 'ParameterInfo', 'StructProperty')
+    if info is None:
+        return None
+    inner = _read_tagged_block(BinaryReader(info[1]), pkg.name_map,
+                               pkg.file_version_ue5)
+    entry = _find_prop(inner, 'Name', 'NameProperty')
+    if entry is None or len(entry[1]) < 8:
+        return None
+    idx = struct.unpack_from('<i', entry[1], 0)[0]
+    return pkg.name_map[idx] if 0 <= idx < len(pkg.name_map) else None
+
+
+def _parse_parameter_values(pkg: Package, array_name: str, value_type: str):
+    """Parse one of the F*ParameterValue arrays of a material instance.
+
+    Yields ``(parameter_name, ParameterValue_bytes)`` pairs.
+    """
+    export_index = _find_material_instance_export(pkg)
+    if export_index is None:
+        return
+    props = _read_export_properties(pkg, export_index)
+    entry = _find_prop(props, array_name, 'ArrayProperty')
+    if entry is None:
+        return
+    for element in _iter_struct_array(pkg, entry[1]):
+        name = _parameter_info_name(pkg, element)
+        value = _find_prop(element, 'ParameterValue', value_type)
+        if name is not None and value is not None:
+            yield name, value[1]
 
 
 def _parse_texture_parameter_values(pkg: Package) -> Dict[str, str]:
-    """Parse ``TextureParameterValues`` from the first export of *pkg*.
+    """Parse ``TextureParameterValues`` from a material instance package.
 
     Returns ``{parameter_name: texture_asset_name}`` for every texture
     parameter override present in the material instance export data.
     """
-    reader = pkg.get_export_data(0)
-    if reader is None:
-        return {}
-
-    data = reader.data
-    offset = _find_property_offset(data, pkg.name_map,
-                                   'TextureParameterValues')
-    if offset < 0:
-        return {}
-
-    use_ext = pkg.file_version_ue5 >= 1011  # UE5_PROPERTY_TAG_EXTENSION
-    reader.seek(offset)
-
-    hdr = _read_property_header(reader, pkg.name_map, use_ext)
-    if hdr is None:
-        return {}
-
-    _prop_name, type_names, _size, _flags = hdr
-    if 'ArrayProperty' not in type_names:
-        return {}
-
-    arr_count = reader.read_int32()
     result: Dict[str, str] = {}
-
-    for _ in range(arr_count):
-        param_name: Optional[str] = None
-        param_value: Optional[str] = None
-
-        # Read inner properties until 'None' sentinel
-        while True:
-            prop_hdr = _read_property_header(reader, pkg.name_map, use_ext)
-            if prop_hdr is None:
-                break
-
-            p_name, p_types, p_size, p_flags = prop_hdr
-            value_start = reader.position()
-
-            if p_name == 'ParameterInfo' and p_types[0] == 'StructProperty':
-                # FMaterialParameterInfo — read inner props
-                while True:
-                    inner_hdr = _read_property_header(reader, pkg.name_map,
-                                                      use_ext)
-                    if inner_hdr is None:
-                        break
-                    i_name, i_types, i_size, _i_flags = inner_hdr
-                    if i_types[0] == 'NameProperty' and i_size >= 8:
-                        val = _read_fname(reader, pkg.name_map)
-                        if i_name == 'Name':
-                            param_name = val
-                    else:
-                        reader.skip(i_size)
-
-            elif p_name == 'ParameterValue' and p_types[0] == 'ObjectProperty':
-                pkg_idx = reader.read_int32()
-                if pkg_idx > 0:
-                    exp_idx = pkg_idx - 1
-                    if 0 <= exp_idx < len(pkg.exports):
-                        param_value = pkg.exports[exp_idx].object_name
-                elif pkg_idx < 0:
-                    imp_idx = -pkg_idx - 1
-                    if 0 <= imp_idx < len(pkg.imports):
-                        param_value = pkg.imports[imp_idx].object_name
-
-            elif p_name == 'ExpressionGUID' and p_types[0] == 'StructProperty':
-                reader.skip(16)  # FGuid raw bytes
-
-            else:
-                reader.skip(p_size)
-
-            # Ensure we consumed exactly *p_size* bytes of value data
-            remaining = p_size - (reader.position() - value_start)
-            if remaining > 0:
-                reader.skip(remaining)
-
-        if param_name is not None and param_value is not None:
-            result[param_name] = param_value
-
+    for name, value in _parse_parameter_values(
+            pkg, 'TextureParameterValues', 'ObjectProperty'):
+        texture = _resolve_package_index(pkg, _read_int32(value))
+        if texture is not None:
+            result[name] = texture
     return result
 
 
 def _parse_scalar_parameter_values(pkg: Package) -> Dict[str, float]:
-    """Parse ``ScalarParameterValues`` from the first export of *pkg*.
+    """Parse ``ScalarParameterValues`` from a material instance package.
 
     Returns ``{parameter_name: float_value}`` for every scalar parameter
     override present in the material instance export data.
     """
-    reader = pkg.get_export_data(0)
-    if reader is None:
-        return {}
-
-    data = reader.data
-    offset = _find_property_offset(data, pkg.name_map,
-                                   'ScalarParameterValues')
-    if offset < 0:
-        return {}
-
-    use_ext = pkg.file_version_ue5 >= 1011
-    reader.seek(offset)
-
-    hdr = _read_property_header(reader, pkg.name_map, use_ext)
-    if hdr is None:
-        return {}
-
-    _prop_name, type_names, _size, _flags = hdr
-    if 'ArrayProperty' not in type_names:
-        return {}
-
-    arr_count = reader.read_int32()
     result: Dict[str, float] = {}
-
-    for _ in range(arr_count):
-        param_name: Optional[str] = None
-        param_value: Optional[float] = None
-
-        while True:
-            prop_hdr = _read_property_header(reader, pkg.name_map, use_ext)
-            if prop_hdr is None:
-                break
-
-            p_name, p_types, p_size, _p_flags = prop_hdr
-            value_start = reader.position()
-
-            if p_name == 'ParameterInfo' and p_types[0] == 'StructProperty':
-                while True:
-                    inner_hdr = _read_property_header(reader, pkg.name_map,
-                                                      use_ext)
-                    if inner_hdr is None:
-                        break
-                    i_name, i_types, i_size, _i_flags = inner_hdr
-                    if i_types[0] == 'NameProperty' and i_size >= 8:
-                        val = _read_fname(reader, pkg.name_map)
-                        if i_name == 'Name':
-                            param_name = val
-                    else:
-                        reader.skip(i_size)
-
-            elif p_name == 'ParameterValue' and p_types[0] == 'FloatProperty':
-                param_value = reader.read_float()
-
-            elif p_name == 'ExpressionGUID' and p_types[0] == 'StructProperty':
-                reader.skip(16)
-
-            else:
-                reader.skip(p_size)
-
-            remaining = p_size - (reader.position() - value_start)
-            if remaining > 0:
-                reader.skip(remaining)
-
-        if param_name is not None and param_value is not None:
-            result[param_name] = param_value
-
+    for name, value in _parse_parameter_values(
+            pkg, 'ScalarParameterValues', 'FloatProperty'):
+        if len(value) >= 4:
+            result[name] = struct.unpack_from('<f', value, 0)[0]
     return result
 
 
@@ -276,28 +239,60 @@ def _parse_scalar_parameter_values(pkg: Package) -> Dict[str, float]:
 # ---------------------------------------------------------------------------
 
 def _build_uasset_index(input_dir: str) -> Dict[str, str]:
-    """Scan *input_dir* for .uasset files and return ``{name: filepath}``.
+    """Scan *input_dir* for .uasset files and return ``{asset name: filepath}``.
 
-    Recursively walks ``Content/`` (or *input_dir* itself if no Content/
-    sub-directory exists) and builds a lookup table used by the other
-    resolution functions.
+    The key is the *object name* of each export flagged ``bIsAsset`` in the
+    package — the name other packages use to import it.  It is not the file
+    name: ``MI_SpaceShip_1.uasset`` can perfectly well contain an asset called
+    ``MI_SpaceShip``, and a mesh importing that material refers to it by the
+    latter.  File names are registered too, but only for names no package
+    claimed, so unparsable packages stay reachable.
+
+    Where several packages export the same asset name, the lexicographically
+    first path wins so that repeated runs resolve identically.
 
     Args:
         input_dir: Project root containing ``Content/`` or the Content
             directory itself.
 
     Returns:
-        Dictionary mapping asset name (without extension) to its full path.
+        Dictionary mapping asset name to the package file that provides it.
     """
     index: Dict[str, str] = {}
+    by_filename: Dict[str, str] = {}
+
     content_dir = os.path.join(input_dir, 'Content')
     if not os.path.isdir(content_dir):
         content_dir = input_dir
+
     for root, _dirs, files in os.walk(content_dir):
         for f in files:
-            if f.endswith('.uasset'):
-                name = os.path.splitext(f)[0]
-                index[name] = os.path.join(root, f)
+            if not f.endswith('.uasset'):
+                continue
+            path = os.path.join(root, f)
+            stem = os.path.splitext(f)[0]
+            if stem not in by_filename or path < by_filename[stem]:
+                by_filename[stem] = path
+            try:
+                pkg = Package(path)
+            except Exception as e:
+                logger.debug(f"Failed to index '{path}': {e}")
+                continue
+            for entry in pkg.exports:
+                if not entry.b_is_asset:
+                    continue
+                previous = index.get(entry.object_name)
+                if previous is None:
+                    index[entry.object_name] = path
+                elif path < previous:
+                    logger.debug(
+                        f"Asset '{entry.object_name}' provided by both "
+                        f"'{previous}' and '{path}' — using the latter")
+                    index[entry.object_name] = path
+
+    for stem, path in by_filename.items():
+        index.setdefault(stem, path)
+
     return index
 
 
@@ -329,11 +324,25 @@ def _get_material_names_from_mesh(mesh_name: str,
 
 def _find_parent_material_name(pkg: Package,
                                material_name: str) -> Optional[str]:
-    """Find the parent material name from a package's import table.
+    """Find the material a material instance inherits from.
 
-    Looks for a ``MaterialInstanceConstant`` or ``Material`` import whose
-    ``object_name`` differs from *material_name*.
+    Reads the ``Parent`` ObjectProperty out of the MaterialInstanceConstant
+    export.  Falls back to scanning the import table for a material other
+    than *material_name* when the property is absent.  Master Materials have
+    no parent, so they return ``None`` rather than the first material they
+    happen to reference.
     """
+    export_index = _find_material_instance_export(pkg)
+    if export_index is None:
+        return None
+
+    props = _read_export_properties(pkg, export_index)
+    entry = _find_prop(props, 'Parent', 'ObjectProperty')
+    if entry is not None:
+        parent = _resolve_package_index(pkg, _read_int32(entry[1]))
+        if parent is not None and parent != material_name:
+            return parent
+
     for imp in pkg.imports:
         if (imp.class_name in ('MaterialInstanceConstant', 'Material')
                 and imp.object_name != material_name):
@@ -341,259 +350,216 @@ def _find_parent_material_name(pkg: Package,
     return None
 
 
+def _lookup_texture(tex_map: Dict[str, str], name: str) -> Optional[str]:
+    """Look *name* up in *tex_map*, falling back to a case-insensitive match."""
+    mapped = tex_map.get(name)
+    if mapped is not None:
+        return mapped
+    lowered = name.lower()
+    for exported_name, exported in tex_map.items():
+        if exported_name.lower() == lowered:
+            return exported
+    return None
+
+
 def _get_base_color_texture_from_material(material_name: str,
                                           uasset_index: Dict[str, str],
-                                          tex_map: Dict[str, str],
-                                          _depth: int = 0) -> Optional[str]:
+                                          tex_map: Dict[str, str]
+                                          ) -> Optional[str]:
     """Resolve a base-colour texture by walking the material parent chain.
 
-    At each level the function parses ``TextureParameterValues`` from the
-    material instance's export data and checks whether any parameter name
-    matches a known base-color slot (``BaseTexture``, ``BaseColor``,
-    ``Diffuse``, ``Albedo``, etc.).  If found, the corresponding texture
-    asset name is looked up in *tex_map* and returned.
+    The chain is walked from the material itself up to the master Material it
+    ultimately derives from (at most 8 parents), collecting two things: the
+    ``TextureParameterValues`` overrides declared at each level, nearest
+    material winning, and the texture samplers the master's BaseColor input
+    actually reads from.
 
-    If no override exists at the current level the function follows the
-    parent ``MaterialInstanceConstant`` import chain recursively (up to
-    8 levels deep).
+    Those two halves are what makes a material instance render: the master
+    says "base colour comes from parameter *BC*", the instance says
+    "*BC* is T_Ship_B".  Matching them is preferred over every other signal.
+    Failing that the master's own default texture is used, then a parameter
+    named after a base-colour slot (``BaseColor``, ``Diffuse``, ``Albedo``, …)
+    for materials whose master is missing from the project, and finally any
+    texture parameter at all.
 
     Args:
         material_name:  Material asset name.
         uasset_index:   Index from :func:`_build_uasset_index`.
         tex_map:        Mapping of texture asset name → exported name / identifier.
-        _depth:         Recursion guard (max 8).
 
     Returns:
         The resolved texture name from *tex_map*, or ``None``.
     """
-    if _depth > 8:
-        return None
+    overrides: Dict[str, str] = {}
+    samplers: List[Sampler] = []
+    visited = set()
+    name: Optional[str] = material_name
 
-    filepath = uasset_index.get(material_name)
-    if filepath is None:
-        return None
+    while name is not None and name not in visited and len(visited) <= 8:
+        visited.add(name)
+        filepath = uasset_index.get(name)
+        if filepath is None:
+            break
+        try:
+            pkg = Package(filepath)
+        except Exception as e:
+            logger.debug(f"Failed to open material package for '{name}': {e}")
+            break
 
-    try:
-        pkg = Package(filepath)
-    except Exception as e:
-        logger.debug(f"Failed to open material package for '{material_name}': {e}")
-        return None
+        for param_name, tex_asset_name in _parse_texture_parameter_values(pkg).items():
+            # The nearest instance in the chain wins.
+            overrides.setdefault(param_name, tex_asset_name)
+        if not samplers:
+            samplers = _get_base_color_samplers(pkg)
+        name = _find_parent_material_name(pkg, name)
 
-    # Parse TextureParameterValues at this level
-    tex_params = _parse_texture_parameter_values(pkg)
-    logger.debug(f"Material '{material_name}' texture params: {tex_params}")
+    logger.debug(f"Material '{material_name}': overrides={overrides} "
+                 f"base-color samplers={samplers}")
 
-    # Look for a base-color parameter name
-    for param_name, tex_asset_name in tex_params.items():
-        if param_name in _BASE_COLOR_PARAM_NAMES:
-            # Resolve via tex_map (case-insensitive fallback)
-            mapped = tex_map.get(tex_asset_name)
-            if mapped is None:
-                for en, ep in tex_map.items():
-                    if en.lower() == tex_asset_name.lower():
-                        mapped = ep
-                        break
-            if mapped is not None:
-                logger.debug(
-                    f"  '{material_name}': base color param '{param_name}' "
-                    f"→ texture '{tex_asset_name}'")
-                return mapped
-
-    # Not found — walk to parent
-    parent_name = _find_parent_material_name(pkg, material_name)
-    if parent_name is not None:
-        # Check if parent is a master Material (not MaterialInstanceConstant)
-        parent_is_master = False
-        for imp in pkg.imports:
-            if imp.object_name == parent_name and imp.class_name == 'Material':
-                parent_is_master = True
-                break
-
-        if not parent_is_master:
-            result = _get_base_color_texture_from_material(
-                parent_name, uasset_index, tex_map, _depth + 1)
-            if result is not None:
-                return result
-
-    # Last resort: if we found ANY texture parameter that maps into
-    # tex_map, use the first one as a fallback
-    for _param_name, tex_asset_name in tex_params.items():
-        mapped = tex_map.get(tex_asset_name)
-        if mapped is None:
-            for en, ep in tex_map.items():
-                if en.lower() == tex_asset_name.lower():
-                    mapped = ep
-                    break
+    # 1. A sampler the BaseColor input reads from, overridden by the instance.
+    for param_name, _default in samplers:
+        override = overrides.get(param_name) if param_name else None
+        mapped = _lookup_texture(tex_map, override) if override else None
         if mapped is not None:
-            logger.debug(
-                f"  '{material_name}': fallback to first available "
-                f"texture '{tex_asset_name}'")
+            logger.debug(f"  '{material_name}': BaseColor parameter "
+                         f"'{param_name}' → '{overrides[param_name]}'")
             return mapped
 
-    # Master Material fallback: when TextureParameterValues is empty
-    # (typical for master Materials, not MaterialInstanceConstants),
-    # parse the MaterialEditorOnlyData export to find the BaseColor
-    # expression, then trace it to a MaterialExpressionTextureSample
-    # and resolve its Texture2D import reference.
-    tex_name = _get_base_color_from_master_material(pkg)
-    if tex_name is not None:
-        mapped = tex_map.get(tex_name)
-        if mapped is None:
-            for en, ep in tex_map.items():
-                if en.lower() == tex_name.lower():
-                    mapped = ep
-                    break
+    # 2. The texture the master material samples by default.
+    for _param_name, default in samplers:
+        mapped = _lookup_texture(tex_map, default) if default else None
         if mapped is not None:
-            logger.debug(
-                f"  '{material_name}': master-material BaseColor "
-                f"expression -> texture '{tex_name}'")
+            logger.debug(f"  '{material_name}': master-material BaseColor "
+                         f"default texture '{default}'")
+            return mapped
+
+    # 3. No usable graph — fall back to a parameter named like a base-colour
+    #    slot, which is all there is to go on when the master material lives
+    #    outside the project.
+    for param_name, tex_asset_name in overrides.items():
+        if param_name in _BASE_COLOR_PARAM_NAMES:
+            mapped = _lookup_texture(tex_map, tex_asset_name)
+            if mapped is not None:
+                logger.debug(f"  '{material_name}': base color param "
+                             f"'{param_name}' → texture '{tex_asset_name}'")
+                return mapped
+
+    # 4. Last resort: any texture parameter that maps into tex_map.
+    for param_name, tex_asset_name in overrides.items():
+        mapped = _lookup_texture(tex_map, tex_asset_name)
+        if mapped is not None:
+            logger.debug(f"  '{material_name}': fallback to first available "
+                         f"texture '{tex_asset_name}' (parameter '{param_name}')")
             return mapped
 
     return None
 
 
-def _get_base_color_from_master_material(pkg: Package) -> Optional[str]:
-    """Parse MaterialEditorOnlyData to find the BaseColor texture.
+def _get_base_color_samplers(pkg: Package) -> List[Sampler]:
+    """List the texture samplers a master Material's BaseColor input reads.
 
     Walks the chain:
       MaterialEditorOnlyData -> BaseColor (FColorMaterialInput)
-        -> Expression (FPackageIndex -> MaterialExpressionTextureSample export)
-          -> Texture (FPackageIndex -> Texture2D import)
+        -> Expression (FPackageIndex -> material expression export)
+          -> … -> texture samplers
 
-    Returns the Texture2D import object name, or None.
+    A material with ``bUseMaterialAttributes`` set leaves BaseColor
+    unconnected and feeds everything through ``MaterialAttributes`` instead,
+    so that input is searched as well.
+
+    Returns an empty list for material instances, which have no expression
+    graph of their own, and for masters whose base colour is unconnected.
     """
-    from .properties import (
-        TAG_HasArrayIndex, TAG_HasPropertyGuid, TAG_HasPropertyExtensions,
-    )
-    from .package import UE5_PROPERTY_TAG_EXTENSION
-
-    # Find the MaterialEditorOnlyData export
     eod_idx = None
     for i in range(pkg.export_count):
         if pkg.get_export_class_name(i) == 'MaterialEditorOnlyData':
             eod_idx = i
             break
     if eod_idx is None:
-        return None
+        return []
 
-    reader = pkg.get_export_data(eod_idx)
-    if reader is None:
-        return None
+    props = _read_export_properties(pkg, eod_idx)
+    for input_name in ('BaseColor', 'MaterialAttributes'):
+        entry = _find_prop(props, input_name, 'StructProperty')
+        if entry is None or entry[0].struct_name not in _EXPRESSION_INPUT_STRUCTS:
+            continue
+        # FMaterialInput opens with the Expression FPackageIndex.
+        samplers = _collect_samplers(pkg, _read_int32(entry[1]))
+        if samplers:
+            return samplers
 
-    use_ext = pkg.file_version_ue5 >= UE5_PROPERTY_TAG_EXTENSION
-
-    # Skip SerializationControl byte
-    reader.seek(1)
-
-    # Read tagged properties until we find BaseColor
-    while reader.can_read(8):
-        name_idx = reader.read_int32()
-        _name_num = reader.read_int32()
-        name = pkg.name_map[name_idx] if 0 <= name_idx < len(pkg.name_map) else f"#{name_idx}"
-
-        if name == 'None':
-            break
-
-        # Read type tree
-        total_nodes = 1
-        type_names: List[str] = []
-        i = 0
-        while i < total_nodes:
-            t_idx = reader.read_int32()
-            _t_num = reader.read_int32()
-            inner_count = reader.read_int32()
-            t_name = pkg.name_map[t_idx] if 0 <= t_idx < len(pkg.name_map) else f"#{t_idx}"
-            type_names.append(t_name)
-            total_nodes += inner_count
-            i += 1
-
-        size = reader.read_int32()
-        flags = reader.read_uint8()
-
-        if flags & TAG_HasArrayIndex:
-            reader.skip(4)
-
-        value_start = reader.position()
-
-        if name == 'BaseColor' and len(type_names) >= 2 and type_names[0] == 'StructProperty':
-            # Parse FColorMaterialInput (FMaterialInput base + UseConstant + Constant)
-            # FMaterialInput:
-            #   Expression: FPackageIndex (int32)
-            #   OutputIndex: int32
-            #   InputName: FName (8 bytes)
-            #   Mask, MaskR, MaskG, MaskB, MaskA: 5 x int32
-            # FColorMaterialInput:
-            #   UseConstant: uint32
-            #   Constant: FColor (4 bytes)
-            if size < 40:
-                reader.skip(size)
-            else:
-                expression_fpi = reader.read_int32()
-                # Skip remaining fields: OutputIndex(4) + InputName(8) +
-                # Mask(4)*5 + UseConstant(4) + Constant(4) = 40 bytes total
-                # We already read 4 (expression_fpi), skip the rest
-                reader.skip(size - 4)
-
-                # Resolve Expression FPackageIndex to an export
-                if expression_fpi > 0:
-                    exp_idx = expression_fpi - 1
-                    if 0 <= exp_idx < len(pkg.exports):
-                        cn = pkg.get_export_class_name(exp_idx)
-                        if cn == 'MaterialExpressionTextureSample':
-                            tex_name = _get_texture_from_expression(pkg, exp_idx)
-                            if tex_name is not None:
-                                return tex_name
-        else:
-            reader.skip(size)
-
-        if flags & TAG_HasPropertyGuid:
-            reader.skip(16)
-        if use_ext and (flags & TAG_HasPropertyExtensions):
-            ext = reader.read_uint8()
-            if ext & 0x01:
-                reader.skip(1 + 4)
-
-        # Ensure alignment
-        remaining = size - (reader.position() - value_start)
-        if remaining > 0:
-            reader.skip(remaining)
-
-    return None
+    return []
 
 
-def _get_texture_from_expression(pkg: Package, exp_idx: int) -> Optional[str]:
-    """Parse a MaterialExpressionTextureSample export to find its Texture reference.
+def _read_sampler(pkg: Package,
+                  props: List[TaggedProperty]) -> Optional[Sampler]:
+    """Read ``(parameter name, default texture)`` from an expression export.
 
-    The export data layout (after SerializationControl byte) is native-serialized.
-    The Texture FPackageIndex is located by scanning for references to Texture2D imports.
-
-    Returns the Texture2D import object name, or None.
+    Texture samplers — ``MaterialExpressionTextureSample`` and the parameter
+    variants that derive from it — all expose the same ``Texture``
+    ObjectProperty, so that property is what identifies a sampler here rather
+    than a list of class names.  Returns ``None`` for any other expression.
     """
-    import struct as _struct
-
-    reader = pkg.get_export_data(exp_idx)
-    if reader is None:
+    entry = _find_prop(props, 'Texture', 'ObjectProperty')
+    if entry is None:
         return None
 
-    data = reader.data
+    texture = None
+    index = _read_int32(entry[1])
+    # Textures used by a material live in another package, so the reference
+    # is always an import.
+    if index is not None and index < 0:
+        imp_idx = -index - 1
+        if (0 <= imp_idx < len(pkg.imports)
+                and pkg.imports[imp_idx].class_name == 'Texture2D'):
+            texture = pkg.imports[imp_idx].object_name
 
-    # Build set of Texture2D import FPackageIndex values
-    tex_imports = {}
-    for imp_i, imp in enumerate(pkg.imports):
-        if imp.class_name == 'Texture2D':
-            fpi = -(imp_i + 1)
-            tex_imports[fpi] = imp.object_name
+    parameter = None
+    named = _find_prop(props, 'ParameterName', 'NameProperty')
+    if named is not None:
+        name_idx = _read_int32(named[1])
+        if name_idx is not None and 0 <= name_idx < len(pkg.name_map):
+            parameter = pkg.name_map[name_idx]
 
-    if not tex_imports:
+    if parameter is None and texture is None:
         return None
+    return parameter, texture
 
-    # Scan for FPackageIndex values that reference Texture2D imports.
-    # The Texture property in MaterialExpressionTextureSample is typically
-    # the first Texture2D reference after the UObject header.
-    for offset in range(0, len(data) - 3):
-        val = _struct.unpack_from('<i', data, offset)[0]
-        if val in tex_imports:
-            return tex_imports[val]
 
-    return None
+def _collect_samplers(pkg: Package, root: Optional[int]) -> List[Sampler]:
+    """Breadth-first search from a material input for texture samplers.
+
+    A base-colour input rarely points straight at a sampler — tint multiplies
+    and blend lerps sit in between, and a blend reads more than one texture.
+    Searching breadth-first returns them ordered by distance from the material
+    output.  Evaluating the graph is out of scope; this only locates textures.
+    """
+    queue = deque([root])
+    visited = set()
+    samplers: List[Sampler] = []
+
+    while queue and len(visited) < _MAX_EXPRESSION_NODES:
+        index = queue.popleft()
+        # Expressions are exports of the material package; a non-positive
+        # index means the input is unconnected or refers elsewhere.
+        if not index or index <= 0 or index in visited:
+            continue
+        visited.add(index)
+
+        exp_idx = index - 1
+        if not 0 <= exp_idx < len(pkg.exports):
+            continue
+
+        props = _read_export_properties(pkg, exp_idx)
+
+        sampler = _read_sampler(pkg, props)
+        if sampler is not None:
+            samplers.append(sampler)
+
+        for tag, value in props:
+            if (tag.type_name == 'StructProperty'
+                    and tag.struct_name in _EXPRESSION_INPUT_STRUCTS):
+                queue.append(_read_int32(value))
+
+    return samplers
 
