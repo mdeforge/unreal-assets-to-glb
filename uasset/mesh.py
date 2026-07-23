@@ -928,95 +928,113 @@ class StaticMesh:
 # GLB export
 # ---------------------------------------------------------------------------
 
-def export_glb(mesh: StaticMesh, filepath: str,
-               textures: Optional[List[Tuple[int, object]]] = None):
-    """Export a StaticMesh as GLB (binary glTF 2.0) with embedded textures.
+# ---------------------------------------------------------------------------
+# UE → glTF basis change
+#
+# UE is left-handed (X forward, Y right, Z up); glTF is right-handed (X right,
+# Y up, -Z forward).  The axis map  glTF = (UE_Y, UE_Z, -UE_X)  has determinant
+# -1, so it flips handedness — and therefore face winding CW→CCW — without
+# needing a negative node scale.
+#
+# UE measures in centimetres, glTF in metres, so distances are scaled by 0.01.
+# A UE 500-unit wall becomes a 5-metre wall rather than a 500-metre one.  The
+# full conversion is  C = 0.01 · axis-swap.
+# ---------------------------------------------------------------------------
+# Default distance scale: glTF is metres, UE is centimetres, so 1 UE unit
+# becomes 0.01 glTF units.  A UE 500-unit wall becomes a 5-metre wall rather
+# than a 500-metre one.  Callers can override it (``--scale``) for pipelines
+# that expect a different unit.
+_UE_TO_GLTF_SCALE = 0.01
 
-    Args:
-        mesh: StaticMesh object with geometry data.
-        filepath: Output ``.glb`` file path.
-        textures: Optional list of ``(material_index, PIL.Image or numpy.ndarray)``
-            tuples.  Each texture is embedded as PNG inside the GLB and assigned
-            to the corresponding material slot.  If *None* or empty, a default
-            grey material is used for every primitive.
+_AXIS_SWAP = np.array([
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [-1.0, 0.0, 0.0],
+])
+
+
+def _basis(scale: float) -> Tuple[np.ndarray, np.ndarray]:
+    """The UE→glTF conversion ``C = scale · axis-swap`` and its inverse.
+
+    The axis swap is orthogonal, so its inverse is its transpose; the scale
+    inverts to ``1/scale``.  ``C`` itself is not orthogonal once scaled, which
+    is why the inverse is built rather than transposed.
     """
-    if not _HAS_PYGLTFLIB:
-        raise ImportError(
-            "pygltflib is required for GLB export.  "
-            "Install with: pip install pygltflib"
-        )
+    c = np.eye(4)
+    c[:3, :3] = scale * _AXIS_SWAP
+    c_inv = np.eye(4)
+    c_inv[:3, :3] = (1.0 / scale) * _AXIS_SWAP.T
+    return c, c_inv
 
-    from io import BytesIO
-    from PIL import Image as PILImage
 
-    dirpath = os.path.dirname(filepath)
-    if dirpath:
-        os.makedirs(dirpath, exist_ok=True)
+def ue_matrix_to_gltf(matrix: np.ndarray,
+                      scale: float = _UE_TO_GLTF_SCALE) -> List[float]:
+    """Convert a UE world transform into a glTF node matrix.
 
-    # Primary UV channel only
-    uvs = mesh.uvs[0] if mesh.uvs else []
-    has_normals = bool(mesh.normals)
-    has_uvs = bool(uvs)
+    Vertices are already stored in glTF axes and scaled, so a UE transform has
+    to be re-expressed in that basis rather than merely applied: the result is
+    ``C·M·C⁻¹``.  The uniform scale cancels out of the rotation/scale part and
+    survives only in the translation, which is exactly what keeps a placed
+    instance's own proportions intact while moving it to the scaled
+    coordinates.  Returned column-major, as glTF requires.
+    """
+    c, c_inv = _basis(scale)
+    converted = c @ np.asarray(matrix, dtype=float) @ c_inv
+    return [float(v) for v in converted.T.flatten()]
 
-    # ------------------------------------------------------------------
-    # Group triangles by material index
-    # ------------------------------------------------------------------
-    material_groups: dict = {}  # material_index -> [(vi0, vi1, vi2), ...]
-    for tri in mesh.triangles:
-        vi0, vi1, vi2 = tri[0], tri[1], tri[2]
-        mat_idx = tri[3] if len(tri) >= 4 else 0
-        material_groups.setdefault(mat_idx, []).append((vi0, vi1, vi2))
 
-    if not material_groups:
-        return
+class _GLBBuilder:
+    """Accumulates meshes, materials and textures into one glTF binary blob.
 
-    # ------------------------------------------------------------------
-    # Build texture lookup  material_index -> PIL.Image
-    # ------------------------------------------------------------------
-    texture_lookup: dict = {}
-    if textures:
-        for item in textures:
-            mat_idx, tex_data = item[0], item[1]
-            if isinstance(tex_data, np.ndarray):
-                if tex_data.ndim == 3 and tex_data.shape[2] == 4:
-                    texture_lookup[mat_idx] = PILImage.fromarray(tex_data, 'RGBA')
-                else:
-                    texture_lookup[mat_idx] = PILImage.fromarray(tex_data)
-            elif hasattr(tex_data, 'save'):  # PIL.Image already
-                texture_lookup[mat_idx] = tex_data
+    Shared by the single-mesh and whole-level exporters so both produce
+    identical geometry, and so a level stores each distinct mesh once however
+    many times it is placed.
+    """
 
-    # ------------------------------------------------------------------
-    # Binary buffer assembly
-    # ------------------------------------------------------------------
-    binary = bytearray()
-    buffer_views: list = []
-    accessors: list = []
-    gltf_images: list = []
-    gltf_textures: list = []
-    gltf_samplers: list = []
-    gltf_materials: list = []
-    gltf_primitives: list = []
+    # glTF constants
+    ARRAY_BUFFER = 34962
+    ELEMENT_ARRAY_BUFFER = 34963
+    COMP_FLOAT = 5126
+    COMP_UNSIGNED_SHORT = 5123
+    COMP_UNSIGNED_INT = 5125
 
-    def _pad4():
-        """Pad *binary* to 4-byte alignment."""
-        rem = len(binary) % 4
+    def __init__(self, scale: float = _UE_TO_GLTF_SCALE):
+        self.scale = scale
+        self.binary = bytearray()
+        self.buffer_views: list = []
+        self.accessors: list = []
+        self.images: list = []
+        self.textures: list = []
+        self.samplers: list = []
+        self.materials: list = []
+        self.meshes: list = []
+        # Texture identity -> glTF texture index.  A level places dozens of
+        # meshes that share one texture; embedding it per mesh would multiply
+        # the file size by the reuse count.
+        self._texture_index: Dict[object, int] = {}
+
+    # -- buffer plumbing --------------------------------------------------
+
+    def _pad4(self):
+        """Pad the binary blob to 4-byte alignment."""
+        rem = len(self.binary) % 4
         if rem:
-            binary.extend(b'\x00' * (4 - rem))
+            self.binary.extend(b'\x00' * (4 - rem))
 
-    def _add_buffer_view(data: bytes, target=None) -> int:
-        _pad4()
-        offset = len(binary)
-        binary.extend(data)
+    def _add_buffer_view(self, data: bytes, target=None) -> int:
+        self._pad4()
+        offset = len(self.binary)
+        self.binary.extend(data)
         bv = BufferView()
         bv.buffer = 0
         bv.byteOffset = offset
         bv.byteLength = len(data)
         if target is not None:
             bv.target = target
-        buffer_views.append(bv)
-        return len(buffer_views) - 1
+        self.buffer_views.append(bv)
+        return len(self.buffer_views) - 1
 
-    def _add_accessor(bv_idx: int, component_type: int, count: int,
+    def _add_accessor(self, bv_idx: int, component_type: int, count: int,
                       acc_type: str, min_vals=None, max_vals=None) -> int:
         acc = Accessor()
         acc.bufferView = bv_idx
@@ -1028,181 +1046,328 @@ def export_glb(mesh: StaticMesh, filepath: str,
             acc.min = list(min_vals)
         if max_vals is not None:
             acc.max = list(max_vals)
-        accessors.append(acc)
-        return len(accessors) - 1
+        self.accessors.append(acc)
+        return len(self.accessors) - 1
 
-    # glTF constants
-    ARRAY_BUFFER = 34962
-    ELEMENT_ARRAY_BUFFER = 34963
-    COMP_FLOAT = 5126
-    COMP_UNSIGNED_SHORT = 5123
-    COMP_UNSIGNED_INT = 5125
+    def _sampler(self) -> int:
+        """Index of the shared texture sampler, created on first use."""
+        if not self.samplers:
+            sampler = Sampler()
+            sampler.magFilter = 9729   # LINEAR
+            sampler.minFilter = 9987   # LINEAR_MIPMAP_LINEAR
+            sampler.wrapS = 10497      # REPEAT
+            sampler.wrapT = 10497      # REPEAT
+            self.samplers.append(sampler)
+        return 0
 
-    # ------------------------------------------------------------------
-    # Materials & textures
-    # ------------------------------------------------------------------
-    sorted_mat_indices = sorted(material_groups.keys())
-    mat_idx_to_gltf_mat: dict = {}
+    def add_mesh(self, mesh: 'StaticMesh',
+                 textures: Optional[List[Tuple[int, object]]] = None,
+                 name: Optional[str] = None) -> Optional[int]:
+        """Add one static mesh; returns its glTF mesh index, or None if empty."""
+        from io import BytesIO
+        from PIL import Image as PILImage
 
-    has_any_texture = any(mi in texture_lookup for mi in sorted_mat_indices)
-    if has_any_texture:
-        sampler = Sampler()
-        sampler.magFilter = 9729   # LINEAR
-        sampler.minFilter = 9987   # LINEAR_MIPMAP_LINEAR
-        sampler.wrapS = 10497      # REPEAT
-        sampler.wrapT = 10497      # REPEAT
-        gltf_samplers.append(sampler)
+        # Primary UV channel only
+        uvs = mesh.uvs[0] if mesh.uvs else []
+        has_normals = bool(mesh.normals)
+        has_uvs = bool(uvs)
 
-    for gltf_mat_idx, mat_idx in enumerate(sorted_mat_indices):
-        mat = Material()
-        mat.pbrMetallicRoughness = PbrMetallicRoughness()
-        mat.pbrMetallicRoughness.baseColorFactor = [1.0, 1.0, 1.0, 1.0]
-        mat.pbrMetallicRoughness.metallicFactor = 0.0
-        mat.pbrMetallicRoughness.roughnessFactor = 1.0
+        # Group triangles by material index
+        material_groups: dict = {}
+        for tri in mesh.triangles:
+            vi0, vi1, vi2 = tri[0], tri[1], tri[2]
+            mat_idx = tri[3] if len(tri) >= 4 else 0
+            material_groups.setdefault(mat_idx, []).append((vi0, vi1, vi2))
 
-        if mat_idx in texture_lookup:
-            pil_img = texture_lookup[mat_idx]
-            buf = BytesIO()
-            pil_img.save(buf, format='PNG')
-            png_bytes = buf.getvalue()
+        if not material_groups:
+            return None
 
-            bv_idx = _add_buffer_view(png_bytes)
-
-            img = GLTFImage()
-            img.bufferView = bv_idx
-            img.mimeType = 'image/png'
-            gltf_images.append(img)
-
-            tex = GLTFTexture()
-            tex.source = len(gltf_images) - 1
-            tex.sampler = 0
-            gltf_textures.append(tex)
-
-            tex_info = TextureInfo()
-            tex_info.index = len(gltf_textures) - 1
-            tex_info.texCoord = 0
-            mat.pbrMetallicRoughness.baseColorTexture = tex_info
-
-        gltf_materials.append(mat)
-        mat_idx_to_gltf_mat[mat_idx] = gltf_mat_idx
-
-    # ------------------------------------------------------------------
-    # Geometry — one primitive per material group
-    # ------------------------------------------------------------------
-    # UE left-handed (X fwd, Y right, Z up) → glTF right-handed
-    # (X right, Y up, -Z fwd).  The mapping  glTF = (UE_Y, UE_Z, -UE_X)
-    # has determinant -1 so it flips handedness (and therefore face
-    # winding CW→CCW) without needing a negative node scale.
-    # ------------------------------------------------------------------
-    for mat_idx in sorted_mat_indices:
-        tris = material_groups[mat_idx]
-
-        # Collect unique vertex instances for this primitive
-        vi_to_local: dict = {}
-        local_verts: list = []  # (px, py, pz, nx, ny, nz, u, v)
-        indices: list = []
-
-        for vi0, vi1, vi2 in tris:
-            for vi in (vi0, vi1, vi2):
-                if vi not in vi_to_local:
-                    # Position — resolve through vi_to_vertex
-                    v_idx = mesh.vi_to_vertex[vi] if vi < len(mesh.vi_to_vertex) else vi
-                    pos = mesh.vertices[v_idx] if v_idx < len(mesh.vertices) else (0.0, 0.0, 0.0)
-                    # UE → glTF:  x=ue_y, y=ue_z, z=-ue_x
-                    px, py, pz = pos[1], pos[2], -pos[0]
-
-                    # Normal — same coordinate conversion
-                    if has_normals and vi < len(mesh.normals):
-                        n = mesh.normals[vi]
-                        nx, ny, nz = n[1], n[2], -n[0]
+        # Build texture lookup  material_index -> (PIL.Image, identity)
+        # An optional third tuple element identifies the texture, letting the
+        # same pixels be embedded once and shared by every material using it.
+        texture_lookup: dict = {}
+        if textures:
+            for item in textures:
+                mat_idx, tex_data = item[0], item[1]
+                identity = item[2] if len(item) > 2 else None
+                if isinstance(tex_data, np.ndarray):
+                    if tex_data.ndim == 3 and tex_data.shape[2] == 4:
+                        image = PILImage.fromarray(tex_data, 'RGBA')
                     else:
-                        nx, ny, nz = 0.0, 1.0, 0.0
+                        image = PILImage.fromarray(tex_data)
+                elif hasattr(tex_data, 'save'):  # PIL.Image already
+                    image = tex_data
+                else:
+                    continue
+                texture_lookup[mat_idx] = (image, identity)
 
-                    # UV — no V-flip needed: UE5 stores textures top-to-bottom
-                    # (same as PNG/glTF), and the UV coordinate (0,0) already
-                    # maps to the first pixel row in both engines.
-                    if has_uvs and vi < len(uvs):
-                        u, v = uvs[vi]
-                    else:
-                        u, v = 0.0, 0.0
+        gltf_primitives: list = []
 
-                    local_verts.append((px, py, pz, nx, ny, nz, u, v))
-                    vi_to_local[vi] = len(local_verts) - 1
+        # -- materials & textures -----------------------------------------
+        sorted_mat_indices = sorted(material_groups.keys())
+        mat_idx_to_gltf_mat: dict = {}
 
-                indices.append(vi_to_local[vi])
+        for mat_idx in sorted_mat_indices:
+            mat = Material()
+            mat.pbrMetallicRoughness = PbrMetallicRoughness()
+            mat.pbrMetallicRoughness.baseColorFactor = [1.0, 1.0, 1.0, 1.0]
+            mat.pbrMetallicRoughness.metallicFactor = 0.0
+            mat.pbrMetallicRoughness.roughnessFactor = 1.0
 
-        if not local_verts:
-            continue
+            if mat_idx in texture_lookup:
+                pil_img, identity = texture_lookup[mat_idx]
+                tex_index = self._texture_index.get(identity) if identity else None
 
-        num_verts = len(local_verts)
+                if tex_index is None:
+                    buf = BytesIO()
+                    pil_img.save(buf, format='PNG')
+                    png_bytes = buf.getvalue()
 
-        # Numpy arrays
-        pos_arr = np.array([(v[0], v[1], v[2]) for v in local_verts], dtype=np.float32)
-        norm_arr = np.array([(v[3], v[4], v[5]) for v in local_verts], dtype=np.float32)
-        uv_arr = np.array([(v[6], v[7]) for v in local_verts], dtype=np.float32)
+                    bv_idx = self._add_buffer_view(png_bytes)
 
-        if num_verts <= 65535:
-            idx_arr = np.array(indices, dtype=np.uint16)
-            idx_comp = COMP_UNSIGNED_SHORT
-        else:
-            idx_arr = np.array(indices, dtype=np.uint32)
-            idx_comp = COMP_UNSIGNED_INT
+                    img = GLTFImage()
+                    img.bufferView = bv_idx
+                    img.mimeType = 'image/png'
+                    self.images.append(img)
 
-        # Position accessor
-        pos_bv = _add_buffer_view(pos_arr.tobytes(), target=ARRAY_BUFFER)
-        pos_acc = _add_accessor(
-            pos_bv, COMP_FLOAT, num_verts, "VEC3",
-            pos_arr.min(axis=0).tolist(), pos_arr.max(axis=0).tolist())
+                    tex = GLTFTexture()
+                    tex.source = len(self.images) - 1
+                    tex.sampler = self._sampler()
+                    self.textures.append(tex)
 
-        # Normal accessor
-        norm_acc = None
-        if has_normals:
-            norm_bv = _add_buffer_view(norm_arr.tobytes(), target=ARRAY_BUFFER)
-            norm_acc = _add_accessor(norm_bv, COMP_FLOAT, num_verts, "VEC3")
+                    tex_index = len(self.textures) - 1
+                    if identity is not None:
+                        self._texture_index[identity] = tex_index
 
-        # UV accessor
-        uv_acc = None
-        if has_uvs:
-            uv_bv = _add_buffer_view(uv_arr.tobytes(), target=ARRAY_BUFFER)
-            uv_acc = _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")
+                tex_info = TextureInfo()
+                tex_info.index = tex_index
+                tex_info.texCoord = 0
+                mat.pbrMetallicRoughness.baseColorTexture = tex_info
 
-        # Index accessor
-        idx_bv = _add_buffer_view(idx_arr.tobytes(), target=ELEMENT_ARRAY_BUFFER)
-        idx_acc = _add_accessor(idx_bv, idx_comp, len(indices), "SCALAR")
+            self.materials.append(mat)
+            mat_idx_to_gltf_mat[mat_idx] = len(self.materials) - 1
 
-        # Primitive
-        prim = Primitive()
-        prim.attributes.POSITION = pos_acc
-        if norm_acc is not None:
-            prim.attributes.NORMAL = norm_acc
-        if uv_acc is not None:
-            prim.attributes.TEXCOORD_0 = uv_acc
-        prim.indices = idx_acc
-        prim.material = mat_idx_to_gltf_mat[mat_idx]
+        self._build_primitives(mesh, uvs, has_normals, has_uvs,
+                               material_groups, sorted_mat_indices,
+                               mat_idx_to_gltf_mat, gltf_primitives)
 
-        gltf_primitives.append(prim)
+        if not gltf_primitives:
+            return None
 
-    # ------------------------------------------------------------------
-    # Assemble glTF
-    # ------------------------------------------------------------------
-    gltf = GLTF2()
-    gltf.scene = 0
-    gltf.scenes = [GLTFScene(nodes=[0])]
+        gltf_mesh = GLTFMesh(primitives=gltf_primitives)
+        if name:
+            gltf_mesh.name = name
+        self.meshes.append(gltf_mesh)
+        return len(self.meshes) - 1
+
+    def _build_primitives(self, mesh, uvs, has_normals, has_uvs,
+                          material_groups, sorted_mat_indices,
+                          mat_idx_to_gltf_mat, gltf_primitives):
+        """One primitive per material group, in glTF axes."""
+        ARRAY_BUFFER = self.ARRAY_BUFFER
+        ELEMENT_ARRAY_BUFFER = self.ELEMENT_ARRAY_BUFFER
+        COMP_FLOAT = self.COMP_FLOAT
+        COMP_UNSIGNED_SHORT = self.COMP_UNSIGNED_SHORT
+        COMP_UNSIGNED_INT = self.COMP_UNSIGNED_INT
+        _add_buffer_view = self._add_buffer_view
+        _add_accessor = self._add_accessor
+        scale = self.scale
+
+        for mat_idx in sorted_mat_indices:
+            tris = material_groups[mat_idx]
+
+            # Collect unique vertex instances for this primitive
+            vi_to_local: dict = {}
+            local_verts: list = []  # (px, py, pz, nx, ny, nz, u, v)
+            indices: list = []
+
+            for vi0, vi1, vi2 in tris:
+                for vi in (vi0, vi1, vi2):
+                    if vi not in vi_to_local:
+                        # Position — resolve through vi_to_vertex
+                        v_idx = mesh.vi_to_vertex[vi] if vi < len(mesh.vi_to_vertex) else vi
+                        pos = mesh.vertices[v_idx] if v_idx < len(mesh.vertices) else (0.0, 0.0, 0.0)
+                        # UE → glTF:  x=ue_y, y=ue_z, z=-ue_x, scaled to glTF units
+                        px, py, pz = pos[1] * scale, pos[2] * scale, -pos[0] * scale
+
+                        # Normal — same coordinate conversion
+                        if has_normals and vi < len(mesh.normals):
+                            n = mesh.normals[vi]
+                            nx, ny, nz = n[1], n[2], -n[0]
+                        else:
+                            nx, ny, nz = 0.0, 1.0, 0.0
+
+                        # UV — no V-flip needed: UE5 stores textures top-to-bottom
+                        # (same as PNG/glTF), and the UV coordinate (0,0) already
+                        # maps to the first pixel row in both engines.
+                        if has_uvs and vi < len(uvs):
+                            u, v = uvs[vi]
+                        else:
+                            u, v = 0.0, 0.0
+
+                        local_verts.append((px, py, pz, nx, ny, nz, u, v))
+                        vi_to_local[vi] = len(local_verts) - 1
+
+                    indices.append(vi_to_local[vi])
+
+            if not local_verts:
+                continue
+
+            num_verts = len(local_verts)
+
+            # Numpy arrays
+            pos_arr = np.array([(v[0], v[1], v[2]) for v in local_verts], dtype=np.float32)
+            norm_arr = np.array([(v[3], v[4], v[5]) for v in local_verts], dtype=np.float32)
+            uv_arr = np.array([(v[6], v[7]) for v in local_verts], dtype=np.float32)
+
+            if num_verts <= 65535:
+                idx_arr = np.array(indices, dtype=np.uint16)
+                idx_comp = COMP_UNSIGNED_SHORT
+            else:
+                idx_arr = np.array(indices, dtype=np.uint32)
+                idx_comp = COMP_UNSIGNED_INT
+
+            # Position accessor
+            pos_bv = _add_buffer_view(pos_arr.tobytes(), target=ARRAY_BUFFER)
+            pos_acc = _add_accessor(
+                pos_bv, COMP_FLOAT, num_verts, "VEC3",
+                pos_arr.min(axis=0).tolist(), pos_arr.max(axis=0).tolist())
+
+            # Normal accessor
+            norm_acc = None
+            if has_normals:
+                norm_bv = _add_buffer_view(norm_arr.tobytes(), target=ARRAY_BUFFER)
+                norm_acc = _add_accessor(norm_bv, COMP_FLOAT, num_verts, "VEC3")
+
+            # UV accessor
+            uv_acc = None
+            if has_uvs:
+                uv_bv = _add_buffer_view(uv_arr.tobytes(), target=ARRAY_BUFFER)
+                uv_acc = _add_accessor(uv_bv, COMP_FLOAT, num_verts, "VEC2")
+
+            # Index accessor
+            idx_bv = _add_buffer_view(idx_arr.tobytes(), target=ELEMENT_ARRAY_BUFFER)
+            idx_acc = _add_accessor(idx_bv, idx_comp, len(indices), "SCALAR")
+
+            # Primitive
+            prim = Primitive()
+            prim.attributes.POSITION = pos_acc
+            if norm_acc is not None:
+                prim.attributes.NORMAL = norm_acc
+            if uv_acc is not None:
+                prim.attributes.TEXCOORD_0 = uv_acc
+            prim.indices = idx_acc
+            prim.material = mat_idx_to_gltf_mat[mat_idx]
+
+            gltf_primitives.append(prim)
+
+    # -- output -----------------------------------------------------------
+
+    def save(self, filepath: str, nodes: list):
+        """Write the accumulated data out as a .glb."""
+        dirpath = os.path.dirname(filepath)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+
+        gltf = GLTF2()
+        gltf.scene = 0
+        gltf.scenes = [GLTFScene(nodes=list(range(len(nodes))))]
+        gltf.nodes = nodes
+        gltf.meshes = self.meshes
+        gltf.materials = self.materials
+        if self.textures:
+            gltf.textures = self.textures
+        if self.samplers:
+            gltf.samplers = self.samplers
+        if self.images:
+            gltf.images = self.images
+        gltf.accessors = self.accessors
+        gltf.bufferViews = self.buffer_views
+        gltf.buffers = [Buffer(byteLength=len(self.binary))]
+
+        gltf.set_binary_blob(bytes(self.binary))
+        gltf.save(filepath)
+
+
+def export_glb(mesh: StaticMesh, filepath: str,
+               textures: Optional[List[Tuple[int, object]]] = None,
+               scale: float = _UE_TO_GLTF_SCALE):
+    """Export a StaticMesh as GLB (binary glTF 2.0) with embedded textures.
+
+    Args:
+        mesh: StaticMesh object with geometry data.
+        filepath: Output ``.glb`` file path.
+        textures: Optional list of ``(material_index, PIL.Image or numpy.ndarray)``
+            tuples.  Each texture is embedded as PNG inside the GLB and assigned
+            to the corresponding material slot.  If *None* or empty, a default
+            grey material is used for every primitive.
+        scale: UE-unit → glTF-unit factor; defaults to centimetres → metres.
+    """
+    if not _HAS_PYGLTFLIB:
+        raise ImportError(
+            "pygltflib is required for GLB export.  "
+            "Install with: pip install pygltflib"
+        )
+
+    builder = _GLBBuilder(scale=scale)
+    mesh_index = builder.add_mesh(mesh, textures)
+    if mesh_index is None:
+        return
+
     # No negative scale needed — the axis remap (UE_Y, UE_Z, -UE_X)
     # already flips handedness and is baked into the geometry.
-    node = GLTFNode(mesh=0)
-    gltf.nodes = [node]
-    gltf.meshes = [GLTFMesh(primitives=gltf_primitives)]
-    gltf.materials = gltf_materials
-    if gltf_textures:
-        gltf.textures = gltf_textures
-    if gltf_samplers:
-        gltf.samplers = gltf_samplers
-    if gltf_images:
-        gltf.images = gltf_images
-    gltf.accessors = accessors
-    gltf.bufferViews = buffer_views
-    gltf.buffers = [Buffer(byteLength=len(binary))]
+    builder.save(filepath, [GLTFNode(mesh=mesh_index)])
 
-    gltf.set_binary_blob(bytes(binary))
-    gltf.save(filepath)
+
+def export_level_glb(meshes: Dict[str, Tuple['StaticMesh', object]],
+                     placements: List[Tuple[str, str, np.ndarray]],
+                     filepath: str,
+                     scale: float = _UE_TO_GLTF_SCALE) -> Tuple[int, int]:
+    """Export a whole level as one GLB with every actor already positioned.
+
+    Each distinct mesh is stored once and referenced by a node per placement,
+    so a level that puts the same wall panel down eighty times costs one copy
+    of its geometry rather than eighty.
+
+    Args:
+        meshes:     ``{key: (StaticMesh, textures)}`` for each distinct mesh,
+                    where *textures* is what :func:`export_glb` accepts.
+        placements: ``(node_name, mesh_key, ue_world_matrix)`` per actor.
+                    Placements naming a key absent from *meshes* are skipped.
+        filepath:   Output ``.glb`` file path.
+        scale:      UE-unit → glTF-unit factor; defaults to centimetres →
+                    metres.  Applied identically to geometry and placements,
+                    so the assembled level stays self-consistent.
+
+    Returns:
+        ``(meshes_written, nodes_written)``.
+    """
+    if not _HAS_PYGLTFLIB:
+        raise ImportError(
+            "pygltflib is required for GLB export.  "
+            "Install with: pip install pygltflib"
+        )
+
+    builder = _GLBBuilder(scale=scale)
+
+    mesh_indices: Dict[str, int] = {}
+    for key, (mesh, textures) in meshes.items():
+        index = builder.add_mesh(mesh, textures, name=key)
+        if index is not None:
+            mesh_indices[key] = index
+
+    nodes = []
+    for node_name, mesh_key, world_matrix in placements:
+        index = mesh_indices.get(mesh_key)
+        if index is None:
+            continue
+        node = GLTFNode(mesh=index)
+        node.name = node_name
+        node.matrix = ue_matrix_to_gltf(world_matrix, scale)
+        nodes.append(node)
+
+    if not nodes:
+        return 0, 0
+
+    builder.save(filepath, nodes)
+    return len(mesh_indices), len(nodes)
