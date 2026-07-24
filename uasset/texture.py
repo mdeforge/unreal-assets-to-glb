@@ -179,9 +179,7 @@ def undo_ue_delta(data: bytes, size_x: int, size_y: int, bpp: int,
 # ---------------------------------------------------------------------------
 
 def _parse_fname(r: BinaryReader, name_map: List[str]) -> str:
-    idx = r.read_int32()
-    r.read_int32()  # instance number
-    return name_map[idx] if 0 <= idx < len(name_map) else f"#{idx}"
+    return r.read_fname(name_map)
 
 
 def _extract_source_struct(struct_data: bytes, name_map: List[str],
