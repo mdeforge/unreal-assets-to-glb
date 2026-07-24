@@ -11,5 +11,6 @@ build/
 dist/
 *.egg-info/
 .eggs/
+venv/
 _testvenv/
 __pycache__/
