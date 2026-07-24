@@ -118,6 +118,13 @@ html, body { width: 100%; height: 100%; overflow: hidden; font-family: 'Segoe UI
 #focus-btn:hover { background: #1a4a80; }
 #focus-btn:disabled { opacity: 0.4; cursor: default; }
 
+/* ---- Model info (GLB mode) ---- */
+#model-info {
+    padding: 10px 16px; font-size: 11px; color: #6666aa; line-height: 1.6;
+    border-bottom: 1px solid #2a2a4a;
+}
+#model-info b { color: #8888cc; font-weight: 600; }
+
 /* ---- Viewport ---- */
 #viewport {
     flex: 1; position: relative; overflow: hidden;
@@ -130,6 +137,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; font-family: 'Segoe UI
     border-radius: 6px; font-size: 11px; color: #8888cc;
     pointer-events: none; line-height: 1.6;
 }
+
 
 #loading-overlay {
     position: absolute; top: 0; left: 0; right: 0; bottom: 0;
@@ -157,7 +165,8 @@ html, body { width: 100%; height: 100%; overflow: hidden; font-family: 'Segoe UI
 <div id="app">
     <!-- Left Sidebar -->
     <div id="sidebar">
-        <h2>Scene Hierarchy</h2>
+        <h2 id="sidebar-title">Scene Hierarchy</h2>
+        <div id="model-info" style="display:none;"></div>
         <button id="export-btn">⬇ EXPORT GLB</button>
         <div id="actor-list"></div>
 
@@ -188,8 +197,8 @@ html, body { width: 100%; height: 100%; overflow: hidden; font-family: 'Segoe UI
                     <label>Z</label><input type="number" step="0.1" id="scl-z">
                 </div>
             </div>
-            <button id="focus-btn" disabled>Focus</button>
         </div>
+        <button id="focus-btn" disabled>Focus</button>
 
         <div class="transform-section">
             <h3>Camera</h3>
@@ -238,16 +247,30 @@ import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 // Globals
 // ===========================================================================
 let scene, camera, renderer;
+let viewportEl = null;
 let sceneData = null;
+
+// Which of the two things the server is showing:
+//   'level' — a .umap, assembled live from per-mesh GLBs + actor transforms
+//   'glb'   — one already-converted .glb, loaded and shown as it is
+let mode = 'level';
+let gridHelper = null;
 let actorObjects = {};      // actorName → THREE.Group
 let actorDataMap = {};       // actorName → actor data from API
 let actorHeaders = {};       // actorName → tree header DOM element
 let selectedActor = null;
 let glbCache = {};           // meshName → Promise<THREE.Group>
 
+// UE-unit → world-unit scale, reported by the server (--scale).  The exporter
+// bakes this factor into the GLB vertices, so every UE distance the viewer
+// uses — actor placements, camera, grid, move speed — must be scaled the same
+// way or geometry and placement disagree by a factor of 100.
+let unitScale = 1.0;
+
 // Camera controls state
 let yaw = 0, pitch = 0;     // camera Euler angles (radians)
-let moveSpeed = 100;         // UE units/sec (cm)
+let moveSpeed = 100;         // world units/sec; sized to the scene on load
+let speedMin = 1, speedMax = 100000;   // scroll-wheel limits, same units
 let keys = {};
 let pointerLocked = false;
 let isDraggingRight = false;
@@ -268,11 +291,34 @@ let camInputFocused = false;
 //   three_z = -ue_x
 
 function ueToThreePos(ueLoc) {
-    return new THREE.Vector3(ueLoc.y, ueLoc.z, -ueLoc.x);
+    return new THREE.Vector3(ueLoc.y * unitScale, ueLoc.z * unitScale, -ueLoc.x * unitScale);
 }
 
 function threeToUEPos(threePos) {
-    return { x: -threePos.z, y: threePos.x, z: threePos.y };
+    return { x: -threePos.z / unitScale, y: threePos.x / unitScale, z: threePos.y / unitScale };
+}
+
+// The UE→glTF basis change, C = unitScale · axis-swap, and its inverse.
+// Mirrors mesh.py::_basis — the axis swap is orthogonal so it inverts by
+// transpose, while the uniform scale inverts to 1/unitScale.
+function ueToThreeBasis() {
+    const s = unitScale;
+    const c = new THREE.Matrix4();
+    c.set(
+        0,  s,  0, 0,
+        0,  0,  s, 0,
+       -s,  0,  0, 0,
+        0,  0,  0, 1
+    );
+    const cInv = new THREE.Matrix4();
+    const i = 1 / unitScale;
+    cInv.set(
+        0,  0, -i, 0,
+        i,  0,  0, 0,
+        0,  i,  0, 0,
+        0,  0,  0, 1
+    );
+    return { conv: c, convInv: cInv };
 }
 
 function ueToThreeMatrix(loc, rot, scale) {
@@ -298,22 +344,10 @@ function ueToThreeMatrix(loc, rot, scale) {
     // Maps UE (X-fwd, Y-right, Z-up) → Three.js (X-right, Y-up, -Z-fwd)
     // glTF = (UE_Y, UE_Z, -UE_X)
     // The similarity transform is needed because GLB geometry is already
-    // in glTF space — we must convert the UE transform to glTF space.
-    const conv = new THREE.Matrix4();
-    conv.set(
-        0,  1,  0, 0,
-        0,  0,  1, 0,
-       -1,  0,  0, 0,
-        0,  0,  0, 1
-    );
-
-    const convInv = new THREE.Matrix4();
-    convInv.set(
-        0,  0, -1, 0,
-        1,  0,  0, 0,
-        0,  1,  0, 0,
-        0,  0,  0, 1
-    );
+    // in glTF space — we must convert the UE transform to glTF space.  The
+    // uniform unitScale cancels out of the rotation/scale part and survives
+    // only in the translation, so the instance keeps its own proportions.
+    const { conv, convInv } = ueToThreeBasis();
 
     // result = conv * m * convInv
     const temp = new THREE.Matrix4();
@@ -327,22 +361,9 @@ function ueToThreeMatrix(loc, rot, scale) {
 function threeToUETransform(obj) {
     const wm = obj.matrixWorld;
     // Inverse coordinate conversion: Three.js → UE
-    // Inverse of (UE_Y, UE_Z, -UE_X) is (-glTF_Z, glTF_X, glTF_Y)
-    const convInv = new THREE.Matrix4();
-    convInv.set(
-        0,  0, -1, 0,
-        1,  0,  0, 0,
-        0,  1,  0, 0,
-        0,  0,  0, 1
-    );
-
-    const conv = new THREE.Matrix4();
-    conv.set(
-        0,  1,  0, 0,
-        0,  0,  1, 0,
-       -1,  0,  0, 0,
-        0,  0,  0, 1
-    );
+    // Inverse of (UE_Y, UE_Z, -UE_X) is (-glTF_Z, glTF_X, glTF_Y), and the
+    // 1/unitScale in convInv puts the translation back into UE centimetres.
+    const { conv, convInv } = ueToThreeBasis();
 
     // ueMat = convInv * wm * conv  (inverse of the similarity transform)
     const temp = new THREE.Matrix4();
@@ -418,59 +439,80 @@ function loadGLB(meshName) {
 // ===========================================================================
 // Scene setup
 // ===========================================================================
+// Lights and grid are per-scene: an Object3D has one parent, so the compare
+// pane needs its own instances rather than a share of the live scene's.
+function makeEnvironment(target) {
+    const ambient = new THREE.AmbientLight(0x404040, 1.0);
+    target.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(1, 1, 1).normalize();
+    target.add(dirLight);
+
+    // Grid — 100 m across, one cell per metre.  In GLB mode frameModel()
+    // replaces it with one sized to the model.
+    gridHelper = new THREE.GridHelper(10000 * unitScale, 100, 0x444466, 0x2a2a44);
+    target.add(gridHelper);
+}
+
 function initThree() {
-    const container = document.getElementById('viewport');
-    const w = container.clientWidth;
-    const h = container.clientHeight;
+    viewportEl = document.getElementById('viewport');
+    const w = viewportEl.clientWidth;
+    const h = viewportEl.clientHeight;
 
     // Scene
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x16213e);
 
-    // Camera
-    camera = new THREE.PerspectiveCamera(60, w / h, 1, 500000);
-    camera.position.set(0, 500, 0);
+    // Camera — clip planes and start height are UE centimetres in world units
+    camera = new THREE.PerspectiveCamera(60, w / h, 1 * unitScale, 500000 * unitScale);
+    camera.position.set(0, 500 * unitScale, 0);
+
+    // Fly speed, likewise: 100 UE cm/sec
+    moveSpeed = 100 * unitScale;
+    speedMin = 1 * unitScale;
+    speedMax = 100000 * unitScale;
 
     // Renderer
     renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setSize(w, h);
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
-    container.appendChild(renderer.domElement);
+    viewportEl.appendChild(renderer.domElement);
 
-    // Lights
-    const ambient = new THREE.AmbientLight(0x404040, 1.0);
-    scene.add(ambient);
+    makeEnvironment(scene);
+    updateViewportSize();
 
-    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
-    dirLight.position.set(1, 1, 1).normalize();
-    scene.add(dirLight);
+    window.addEventListener('resize', updateViewportSize);
+}
 
-    // Grid
-    const grid = new THREE.GridHelper(10000, 100, 0x444466, 0x2a2a44);
-    scene.add(grid);
-
-    // Resize handler
-    window.addEventListener('resize', () => {
-        const w2 = container.clientWidth;
-        const h2 = container.clientHeight;
-        camera.aspect = w2 / h2;
-        camera.updateProjectionMatrix();
-        renderer.setSize(w2, h2);
-    });
+function updateViewportSize() {
+    const w = viewportEl.clientWidth;
+    const h = viewportEl.clientHeight;
+    renderer.setSize(w, h);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
 }
 
 // ===========================================================================
 // Build scene from API data
 // ===========================================================================
-async function buildScene() {
-    const loadingText = document.getElementById('loading-text');
-
-    // Fetch scene data
-    loadingText.textContent = 'Fetching scene data…';
+// Fetched before initThree() so the world-unit scale is known while the
+// camera, grid and fly speed are being sized.
+async function fetchSceneData() {
     const resp = await fetch('/api/scene');
-    if (!resp.ok) { loadingText.textContent = 'Failed to load scene data'; return; }
+    if (!resp.ok) return false;
     sceneData = await resp.json();
+    mode = sceneData.mode === 'glb' ? 'glb' : 'level';
+    if (typeof sceneData.unit_scale === 'number' && sceneData.unit_scale > 0) {
+        unitScale = sceneData.unit_scale;
+    }
+    return true;
+}
+
+async function buildScene() {
+    if (mode === 'glb') return buildGLBScene();
+
+    const loadingText = document.getElementById('loading-text');
 
     const actors = sceneData.actors;
     loadingText.textContent = `Loading ${actors.length} actors…`;
@@ -553,6 +595,166 @@ function createActorObject(actor) {
         actorObjects[actor.name] = group;
         actorDataMap[actor.name] = actor;
     });
+}
+
+// ===========================================================================
+// GLB mode — show one already-converted file, as it is
+// ===========================================================================
+// Nothing here goes near a .uasset or a UE transform: the file is loaded and
+// added to the scene untouched, which is the point — what you see is what the
+// converter actually wrote.
+async function buildGLBScene() {
+    const loadingText = document.getElementById('loading-text');
+    const model = sceneData.model || {};
+    const sizeNote = model.size_mb ? ` (${model.size_mb} MB)` : '';
+    loadingText.textContent = `Loading ${model.name || 'model'}${sizeNote}…`;
+
+    let gltf;
+    try {
+        gltf = await new Promise((resolve, reject) => {
+            new GLTFLoader().load('/api/model.glb', resolve, xhr => {
+                if (xhr.lengthComputable) {
+                    const pct = Math.round((xhr.loaded / xhr.total) * 100);
+                    loadingText.textContent =
+                        `Loading ${model.name || 'model'}${sizeNote} — ${pct}%`;
+                }
+            }, reject);
+        });
+    } catch (err) {
+        console.error('Failed to load GLB:', err);
+        loadingText.textContent = `Failed to load ${model.name || 'the GLB'} `
+                                + `— see the browser console.`;
+        return;
+    }
+
+    scene.add(gltf.scene);
+    frameModel(gltf.scene);
+    populateNodeTree(gltf.scene);
+    showModelInfo(gltf.scene, model);
+
+    document.getElementById('loading-overlay').classList.add('hidden');
+}
+
+// Size the viewer from the model's own extent.  A converted GLB carries
+// whatever units it was written in — metres by default, centimetres with
+// --scale 1.0 — and nothing in the file says which, so measuring the model
+// beats trusting a factor: clip planes, grid, fly speed and the opening
+// camera all come out sensible either way.
+function frameModel(root) {
+    const box = new THREE.Box3().setFromObject(root);
+    if (box.isEmpty()) return;
+
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    const diag = Math.max(size.length(), 1e-6);
+
+    // Close enough to inspect a surface without clipping through it, far
+    // enough to hold the whole model, and a near:far ratio (1:16000) that
+    // still leaves the depth buffer room to work.
+    camera.near = diag / 2000;
+    camera.far = diag * 8;
+
+    // Roughly eight seconds to fly the length of the model, and a wheel range
+    // either side of that.
+    moveSpeed = diag / 8;
+    speedMin = diag / 2000;
+    speedMax = diag * 4;
+
+    // Grid a little wider than the footprint, sitting at the model's base
+    if (gridHelper) {
+        scene.remove(gridHelper);
+        gridHelper.geometry.dispose();
+        gridHelper.material.dispose();
+    }
+    const extent = Math.max(size.x, size.z, diag * 0.1) * 1.5;
+    gridHelper = new THREE.GridHelper(extent, 40, 0x444466, 0x2a2a44);
+    gridHelper.position.set(center.x, box.min.y, center.z);
+    scene.add(gridHelper);
+
+    // Open on a three-quarter view of the whole thing
+    camera.position.set(center.x + diag * 0.6,
+                        center.y + diag * 0.45,
+                        center.z + diag * 0.6);
+    camera.lookAt(center);
+    const euler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+    yaw = euler.y;
+    pitch = euler.x;
+
+    updateViewportSize();   // picks up the new clip planes
+}
+
+function showModelInfo(root, model) {
+    let meshes = 0, tris = 0;
+    root.traverse(o => {
+        if (!o.isMesh) return;
+        meshes++;
+        const g = o.geometry;
+        tris += (g.index ? g.index.count : g.attributes.position.count) / 3;
+    });
+
+    const box = new THREE.Box3().setFromObject(root);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const dim = v => v.toFixed(v < 10 ? 2 : 0);
+
+    document.getElementById('sidebar-title').textContent = 'GLB Contents';
+    const info = document.getElementById('model-info');
+    info.style.display = 'block';
+    // Root children are the placements the exporter wrote; the traversal count
+    // is higher because a mesh split across materials becomes several.
+    info.innerHTML =
+        `<b>${model.name || 'model.glb'}</b>` +
+        (model.size_mb ? ` · ${model.size_mb} MB` : '') + '<br>' +
+        `${root.children.length.toLocaleString()} nodes · ` +
+        `${meshes.toLocaleString()} meshes · ` +
+        `${Math.round(tris).toLocaleString()} triangles<br>` +
+        `extent ${dim(size.x)} × ${dim(size.y)} × ${dim(size.z)} ` +
+        `<span style="color:#555577">(file units)</span>`;
+}
+
+// One row per node under the GLB's root — for a level GLB from --export-level
+// that is one row per placed actor, since the exporter names nodes after them.
+function populateNodeTree(root) {
+    const list = document.getElementById('actor-list');
+    list.innerHTML = '';
+
+    const nodes = root.children.slice().sort((a, b) =>
+        (a.name || '').localeCompare(b.name || ''));
+
+    nodes.forEach((node, i) => {
+        const name = node.name || `node_${i}`;
+        actorObjects[name] = node;
+
+        const header = document.createElement('div');
+        header.className = 'tree-header';
+        header.style.paddingLeft = '8px';
+
+        const spacer = document.createElement('span');
+        spacer.className = 'tree-spacer';
+        header.appendChild(spacer);
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'actor-name';
+        nameSpan.textContent = name;
+        header.appendChild(nameSpan);
+
+        const pos = new THREE.Vector3();
+        node.getWorldPosition(pos);
+        const locSpan = document.createElement('span');
+        locSpan.className = 'actor-loc';
+        locSpan.textContent = `${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`;
+        header.appendChild(locSpan);
+
+        header.dataset.name = name;
+        actorHeaders[name] = header;
+        header.addEventListener('click', () => selectActor(name));
+        list.appendChild(header);
+    });
+
+    document.getElementById('no-selection').textContent =
+        nodes.length ? 'Click a node to focus it' : 'The GLB has no nodes';
 }
 
 // ===========================================================================
@@ -772,9 +974,11 @@ function selectActor(name) {
         header.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     }
 
-    // Show transform
-    document.getElementById('no-selection').style.display = 'none';
-    document.getElementById('selected-transform').style.display = 'block';
+    // Show transform.  A GLB node has no UE transform behind it, so the
+    // editable panel stays hidden there and only Focus is offered.
+    const hasUEData = !!actorDataMap[name];
+    document.getElementById('no-selection').style.display = hasUEData ? 'none' : '';
+    document.getElementById('selected-transform').style.display = hasUEData ? 'block' : 'none';
     document.getElementById('focus-btn').disabled = false;
 
     updateTransformInputs();
@@ -854,6 +1058,18 @@ function updateCameraFromYawPitch() {
 function updateCameraInputs() {
     if (camInputFocused) return;
 
+    // In GLB mode there is no UE frame to report in — a converted file's own
+    // coordinates are the only ones that mean anything — so show those.
+    if (mode === 'glb') {
+        document.getElementById('cam-x').value = camera.position.x.toFixed(2);
+        document.getElementById('cam-y').value = camera.position.y.toFixed(2);
+        document.getElementById('cam-z').value = camera.position.z.toFixed(2);
+        document.getElementById('cam-p').value = (pitch * 180 / Math.PI).toFixed(1);
+        document.getElementById('cam-ya').value = (yaw * 180 / Math.PI).toFixed(1);
+        document.getElementById('cam-r').value = '0.0';
+        return;
+    }
+
     // Convert camera back to UE space
     const ue = threeToUETransform(camera);
 
@@ -866,17 +1082,21 @@ function updateCameraInputs() {
 }
 
 function onCameraInput() {
-    const loc = {
-        x: parseFloat(document.getElementById('cam-x').value) || 0,
-        y: parseFloat(document.getElementById('cam-y').value) || 0,
-        z: parseFloat(document.getElementById('cam-z').value) || 0,
-    };
-    const rot = {
-        pitch: parseFloat(document.getElementById('cam-p').value) || 0,
-        yaw:   parseFloat(document.getElementById('cam-ya').value) || 0,
-        roll:  parseFloat(document.getElementById('cam-r').value) || 0,
-    };
-    setCameraFromUE(loc, rot);
+    const num = id => parseFloat(document.getElementById(id).value) || 0;
+
+    if (mode === 'glb') {
+        camera.position.set(num('cam-x'), num('cam-y'), num('cam-z'));
+        pitch = num('cam-p') * Math.PI / 180;
+        yaw = num('cam-ya') * Math.PI / 180;
+        pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, pitch));
+        updateCameraFromYawPitch();
+        return;
+    }
+
+    setCameraFromUE(
+        { x: num('cam-x'), y: num('cam-y'), z: num('cam-z') },
+        { pitch: num('cam-p'), yaw: num('cam-ya'), roll: num('cam-r') }
+    );
 }
 
 // ===========================================================================
@@ -1046,7 +1266,7 @@ function setupInputHandlers() {
         } else {
             moveSpeed /= 1.2;
         }
-        moveSpeed = Math.max(1, Math.min(100000, moveSpeed));
+        moveSpeed = Math.max(speedMin, Math.min(speedMax, moveSpeed));
     }, { passive: false });
 
     // Transform inputs
@@ -1107,10 +1327,23 @@ function animate() {
 // ===========================================================================
 // Init
 // ===========================================================================
-initThree();
-setupInputHandlers();
-buildScene();
-animate();
+(async function start() {
+    const loadingText = document.getElementById('loading-text');
+    loadingText.textContent = 'Fetching scene data…';
+    const ok = await fetchSceneData();
+
+    initThree();
+    setupInputHandlers();
+    animate();
+
+    // Nothing to re-export in GLB mode — the file is already the artefact.
+    if (mode === 'glb') {
+        document.getElementById('export-btn').style.display = 'none';
+    }
+
+    if (!ok) { loadingText.textContent = 'Failed to load scene data'; return; }
+    buildScene();
+})();
 </script>
 </body>
 </html>

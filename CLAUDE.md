@@ -38,6 +38,13 @@ python main.py ./Input --export-level L_Showcase.umap
 # Same, reusing an existing Export/ (skips the per-mesh GLBs entirely)
 python main.py ./Input --skip-export --export-level L_Showcase.umap
 
+# Look at a converted GLB on its own — no project, no re-export.  This is the
+# file exactly as written, so it is what to check a conversion against.
+python main.py --preview-glb ./Export/Levels/L_Showcase.glb
+
+# Run it alongside a preview that already holds port 3050
+python main.py --preview-glb ./Export/Levels/L_Showcase.glb --port 3060
+
 # Meshes only — no separate PNGs (textures are still embedded in the GLBs)
 python main.py ./Input --skip-textures
 
@@ -54,7 +61,9 @@ in the wheel/sdist.
 | Flag | Meaning |
 | --- | --- |
 | `input_dir` (positional) | Folder containing `.uproject` + `Content/` (default `./Input`; omitting *every* argument prints help instead of running) |
-| `--preview LEVEL.umap` | Parse the level and serve a Three.js preview on port 3050 |
+| `--preview LEVEL.umap` | Parse the level and serve a Three.js preview, assembled live from the per-mesh GLBs |
+| `--preview-glb FILE.glb` | Serve a preview of one already-converted GLB, as written. No project or export needed; ignores `--scale` |
+| `--port N` | Preview port (default `3050`) |
 | `--export-level LEVEL.umap` | Assemble the level into `Export/Levels/<Level>.glb`, actors positioned |
 | `--scale FACTOR` | UE-unit → glTF-unit scale (default `0.01`: UE cm → glTF m). `1.0` keeps centimetres |
 | `--export-dir DIR` | Output directory (default `./Export`) |
@@ -105,8 +114,8 @@ Everything lives in the `uasset/` package. Parsing pipeline, roughly:
 | `scene.py` | Asset index (keyed by parsed export object name) and mesh → material → base-color texture resolution: parent-chain walk, `TextureParameterValues` overrides, cross-package BaseColor expression graph, material layers |
 | `umap.py` | `.umap` level parsing: actors, transforms, static-mesh references, level instancing, World Partition external actors |
 | `transform.py` | UE `FRotator`/transform math → matrices for the renderer |
-| `preview_server.py` | stdlib `http.server` on port 3050; serves `preview.html`, a scene JSON, and files from `Export/Meshes` + `Export/Textures` |
-| `preview.html` | Three.js viewer (shipped as package data) |
+| `preview_server.py` | stdlib `http.server` on port 3050 (`--port`); serves `preview.html`, a scene JSON, and either `Export/Meshes` + `Export/Textures` (level mode) or one GLB at `/api/model.glb` (`--preview-glb`) |
+| `preview.html` | Three.js viewer (shipped as package data); level mode and GLB mode |
 
 ### Texture resolution, in detail
 
@@ -214,9 +223,56 @@ scale cancels out of a node matrix's rotation/scale part and survives only in it
 the per-mesh and level exporters take the same factor, so individual assets and the assembled level
 always agree; `--scale 1.0` keeps UE centimetres throughout.
 
+`--preview LEVEL.umap` is a third consumer of the same conversion and has to be kept in step: it
+loads the per-mesh GLBs, whose vertices are already scaled, but places them from raw UE actor
+transforms. (`--preview-glb` does not — see below — since a finished GLB needs no placement.)
+`preview_server` therefore reports the factor as `unit_scale` in the scene JSON and `preview.html`
+rebuilds `C`/`C⁻¹` from it in `ueToThreeBasis` — the JS mirror of `mesh._basis`. Everything else the
+viewer measures in UE centimetres (camera clip planes and start height, grid extent, fly speed) is
+scaled by the same `unitScale`, which is why it is fetched *before* `initThree`. Leave it at 1.0 and
+geometry comes out 100× too small for its placements. `--scale` must match the factor `Export/` was
+written with; `--skip-export --preview` with a different value will disagree.
+
 Actors whose mesh isn't in the project are skipped and reported — engine content such as
 `/Engine/BasicShapes/Cube` is the common case. Skeletal-mesh actors are out of scope, so a level
 assembles from its static meshes only.
+
+### Checking a conversion: `--preview-glb`
+
+There is no test suite, so the way to check a conversion is to look at the file that came out.
+`--preview-glb FILE.glb` serves exactly that — the finished GLB, loaded and shown as written:
+
+```bash
+unreal-assets-to-glb --preview-glb ./Export/Levels/MainLevel.glb
+```
+
+It needs no project, no `Input/`, no `Content/` and no re-export, so it runs before any of the
+project checks in `main()` and returns straight after. Any GLB works — an assembled level or one
+mesh out of `Export/Meshes/`.
+
+**Units do not enter into it.** The viewer measures the model (`frameModel`) and sizes clip planes,
+grid, fly speed and the opening camera from its bounding-box diagonal, so a level exported in metres
+and the same level in centimetres are framed identically. Nothing here consults `unit_scale` or
+`--scale`; that plumbing exists only for `--preview LEVEL.umap`, which still places per-mesh GLBs
+from raw UE actor transforms and so has to agree with how they were written.
+
+The viewer branches on `mode` in the scene JSON:
+
+| | `--preview LEVEL.umap` (`mode: "level"`) | `--preview-glb FILE.glb` (`mode: "glb"`) |
+| --- | --- | --- |
+| Source | `.umap` + `Export/Meshes/*.glb` | the one file, via `/api/model.glb` |
+| Placement | `ueToThreeMatrix` per actor, at load | already baked into the file |
+| Sidebar | actor hierarchy, editable UE transforms | node list, model stats, Focus only |
+| Camera readout | UE centimetres | the file's own coordinates |
+| Sizing | `unit_scale` from the server | the model's bounding box |
+
+A level GLB runs to hundreds of MB (MainLevel is 225 MB), so `_serve_model` streams it rather than
+buffering a second copy, and the loader reports percentage while it arrives.
+
+Both modes take `--port` (default 3050). It exists because a second preview on a port that is
+already serving used to bind anyway: Windows honours `SO_REUSEADDR` against a live listener, so the
+two servers then answered requests at random — the page from one, its scene JSON from the other.
+`_PreviewServer` disables the flag on Windows so the collision fails loudly instead.
 
 ### World Partition
 
