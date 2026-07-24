@@ -12,7 +12,16 @@ import numpy as np
 
 from .package import Package
 from .properties import read_properties
+from .lights import (CAMERA_COMPONENT_CLASSES, LIGHT_COMPONENT_CLASSES,
+                     resolve_component_properties)
 from .transform import rotator_to_matrix
+
+
+# Light and camera components are collected wherever they appear, including
+# inside Blueprint actors, so they take part in the same component parent-chain
+# transform resolution the mesh components use.
+_EMITTER_COMPONENT_CLASSES = frozenset(
+    LIGHT_COMPONENT_CLASSES + CAMERA_COMPONENT_CLASSES)
 
 
 # ---------------------------------------------------------------------------
@@ -36,10 +45,30 @@ class LevelActor:
 
 
 @dataclass
+class LevelEmitter:
+    """A light or camera component placed in a level.
+
+    Kept separate from :class:`LevelActor` because neither carries geometry —
+    what matters is the component's own world transform, which is also why
+    these are collected per *component* rather than per actor: a Blueprint such
+    as ``BP_StandLight_C`` places its light as a child component, and only
+    walking components finds those alongside plain ``PointLight`` actors.
+    """
+    name: str = ""
+    class_name: str = ""                 # UE component class
+    props: dict = field(default_factory=dict)
+    world_location: tuple = (0.0, 0.0, 0.0)
+    world_rotation: tuple = (0.0, 0.0, 0.0)
+    world_scale: tuple = (1.0, 1.0, 1.0)
+
+
+@dataclass
 class LevelData:
     """Parsed level/map data."""
     map_name: str = ""
     actors: List[LevelActor] = field(default_factory=list)
+    lights: List[LevelEmitter] = field(default_factory=list)
+    cameras: List[LevelEmitter] = field(default_factory=list)
     camera_location: tuple = (0.0, 0.0, 0.0)   # From PlayerStart/CameraActor
     camera_rotation: tuple = (0.0, 0.0, 0.0)   # (pitch, yaw, roll) in degrees
     has_camera: bool = False                     # Whether a camera actor was found
@@ -354,11 +383,16 @@ def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
     export_props: Dict[int, dict] = {}
     for i in range(pkg.export_count):
         class_name = pkg.get_export_class_name(i)
-        if class_name in ("StaticMeshActor", "StaticMeshComponent",
-                          "SceneComponent", "ModelComponent", "Actor",
-                          "PlayerStart", "CameraActor", "PlayerStartPIE",
-                          "SpringArmComponent", "CameraComponent",
-                          "LevelInstance"):
+        if (class_name in ("StaticMeshActor", "StaticMeshComponent",
+                           "SceneComponent", "ModelComponent", "Actor",
+                           "PlayerStart", "CameraActor", "PlayerStartPIE",
+                           "SpringArmComponent", "CameraComponent",
+                           "LevelInstance")
+                or class_name in _EMITTER_COMPONENT_CLASSES
+                # Actors are the bIsAsset exports; reading them is what lets a
+                # light be named after the actor that placed it rather than
+                # after its component.
+                or pkg.exports[i].b_is_asset):
             try:
                 props = _read_export_properties(pkg, i)
                 if props:
@@ -375,12 +409,17 @@ def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
     comp_info: Dict[int, dict] = {}  # comp_export_idx → {loc, rot, scl, parent_comp_idx}
     for i in range(pkg.export_count):
         class_name = export_classes.get(i)
-        if class_name in ("StaticMeshComponent", "SceneComponent",
-                          "ModelComponent", "SpringArmComponent",
-                          "CameraComponent"):
+        if (class_name in ("StaticMeshComponent", "SceneComponent",
+                           "ModelComponent", "SpringArmComponent",
+                           "CameraComponent")
+                or class_name in _EMITTER_COMPONENT_CLASSES):
             props = export_props.get(i)
             if props is None:
-                continue
+                # A light left entirely at its defaults serializes nothing, but
+                # it is still placed and still lights the scene.
+                if class_name not in _EMITTER_COMPONENT_CLASSES:
+                    continue
+                props = {}
             loc = _get_vector(props, "RelativeLocation", (0.0, 0.0, 0.0))
             rot = _get_rotator(props, "RelativeRotation", (0.0, 0.0, 0.0))
             scl = _get_vector(props, "RelativeScale3D", (1.0, 1.0, 1.0))
@@ -402,12 +441,13 @@ def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
 
     # Build component export index → owning actor label map.
     comp_to_actor: Dict[int, str] = {}
-    _actor_classes = ("StaticMeshActor", "Actor", "PlayerStart",
-                      "CameraActor", "PlayerStartPIE")
     for i in range(pkg.export_count):
-        if export_classes.get(i) not in _actor_classes:
+        # Any export that owns a RootComponent is an actor, whatever its class.
+        # Listing classes here would miss PointLight, RectLight and every
+        # Blueprint class, which is what named their lights "LightComponent0".
+        actor_props = export_props.get(i)
+        if not actor_props or "RootComponent" not in actor_props:
             continue
-        actor_props = export_props.get(i, {})
         root_comp_idx = actor_props.get("RootComponent")
         if isinstance(root_comp_idx, int) and root_comp_idx > 0:
             comp_idx = root_comp_idx - 1
@@ -624,6 +664,8 @@ def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
     # packages rather than in the map.  Each one holds a complete actor with
     # its components, so the same parsing applies; the transform of this level
     # is applied to them below along with the map's own actors.
+    external_lights: List[LevelEmitter] = []
+    external_cameras: List[LevelEmitter] = []
     for ext_path in _find_external_actor_packages(filepath):
         ext_abs = os.path.normpath(os.path.abspath(ext_path))
         if ext_abs in _visited:
@@ -634,6 +676,8 @@ def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
             print(f"[umap] Failed to parse external actor {ext_path}: {exc}")
             continue
         actors.extend(ext_level.actors)
+        external_lights.extend(ext_level.lights)
+        external_cameras.extend(ext_level.cameras)
         if not has_camera and ext_level.has_camera:
             camera_location = ext_level.camera_location
             camera_rotation = ext_level.camera_rotation
@@ -642,6 +686,8 @@ def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
     # Phase 5: Process LevelInstance actors (recursive sub-levels).
     # Record how many actors came from this level before recursing.
     local_actor_count = len(actors)
+    sub_lights: List[LevelEmitter] = []
+    sub_cameras: List[LevelEmitter] = []
 
     for i in range(pkg.export_count):
         if export_classes.get(i) != "LevelInstance":
@@ -704,6 +750,56 @@ def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
                 actor.parent = li_name
 
         actors.extend(sub_level.actors)
+        sub_lights.extend(sub_level.lights)
+        sub_cameras.extend(sub_level.cameras)
+
+    # Phase 6: Lights and cameras.
+    #
+    # Collected per *component*, not per actor: a PointLight actor holds its
+    # PointLightComponent, but BP_StandLight_C holds a RectLightComponent as
+    # one child among several, and only walking components finds both.  The
+    # component's own world transform is what places it, so it goes through the
+    # same parent chain the mesh components use.
+    lights: List[LevelEmitter] = []
+    cameras: List[LevelEmitter] = []
+    for i in range(pkg.export_count):
+        class_name = export_classes.get(i)
+        if class_name not in _EMITTER_COMPONENT_CLASSES:
+            continue
+        world_mat = _get_world_transform(i)
+        world_loc, world_rot, world_scl = _decompose_ue_transform(world_mat)
+        # A light placed directly is its actor's root component, but one inside
+        # a Blueprint hangs off DefaultSceneRoot, so the actor name is found by
+        # climbing to the root the same way the transform was.
+        owner, node = None, i
+        for _ in range(32):
+            if node in comp_to_actor:
+                owner = comp_to_actor[node]
+                break
+            parent = comp_info.get(node, {}).get('parent_comp_idx', -1)
+            if parent < 0:
+                break
+            node = parent
+        component_name = pkg.exports[i].object_name
+        emitter = LevelEmitter(
+            name=(f"{owner}.{component_name}" if owner else component_name),
+            class_name=class_name,
+            props=resolve_component_properties(pkg, export_props.get(i, {})),
+            world_location=world_loc,
+            world_rotation=world_rot,
+            world_scale=world_scl,
+        )
+        (cameras if class_name in CAMERA_COMPONENT_CLASSES
+         else lights).append(emitter)
+
+    # External actors belong to this level, so they take its transform; a
+    # LevelInstance's contents already had their own applied when it recursed.
+    lights.extend(external_lights)
+    cameras.extend(external_cameras)
+    local_light_count = len(lights)
+    local_camera_count = len(cameras)
+    lights.extend(sub_lights)
+    cameras.extend(sub_cameras)
 
     # Apply parent_transform to actors parsed directly from this level
     if parent_transform is not None and not np.allclose(parent_transform, np.eye(4)):
@@ -716,10 +812,22 @@ def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
             actor.world_location = loc
             actor.world_rotation = rot
             actor.world_scale = scl
+        for emitter in (lights[:local_light_count]
+                        + cameras[:local_camera_count]):
+            local = _make_ue_transform(emitter.world_location,
+                                       emitter.world_rotation,
+                                       emitter.world_scale)
+            world = parent_transform @ local
+            loc, rot, scl = _decompose_ue_transform(world)
+            emitter.world_location = loc
+            emitter.world_rotation = rot
+            emitter.world_scale = scl
 
     return LevelData(
         map_name=map_name,
         actors=actors,
+        lights=lights,
+        cameras=cameras,
         camera_location=camera_location,
         camera_rotation=camera_rotation,
         has_camera=has_camera,
