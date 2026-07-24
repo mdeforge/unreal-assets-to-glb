@@ -5,7 +5,7 @@ Key difference from UE4: FileVersionUE5 comes BEFORE FileVersionLicenseeUE4.
 """
 import struct
 from typing import List, Optional, Tuple
-from .reader import BinaryReader
+from .reader import BinaryReader, resolve_fname
 
 
 # UE4 ObjectVersion enum values (from UAssetAPI ObjectVersion.cs)
@@ -356,16 +356,16 @@ class Package:
         for _ in range(self.import_count):
             entry = ImportEntry()
             cp_idx = r.read_int32()
-            _cp_num = r.read_int32()
+            cp_num = r.read_int32()
             cn_idx = r.read_int32()
-            _cn_num = r.read_int32()
+            cn_num = r.read_int32()
             entry.outer_index = r.read_int32()
             on_idx = r.read_int32()
-            _on_num = r.read_int32()
+            on_num = r.read_int32()
 
-            entry.class_package = self.name_map[cp_idx] if 0 <= cp_idx < len(self.name_map) else f"#{cp_idx}"
-            entry.class_name = self.name_map[cn_idx] if 0 <= cn_idx < len(self.name_map) else f"#{cn_idx}"
-            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"
+            entry.class_package = resolve_fname(self.name_map, cp_idx, cp_num)
+            entry.class_name = resolve_fname(self.name_map, cn_idx, cn_num)
+            entry.object_name = resolve_fname(self.name_map, on_idx, on_num)
 
             if has_package_name:
                 r.skip(8)  # PackageName (FName: index + number)
@@ -400,8 +400,8 @@ class Package:
 
             # ObjectName FName
             on_idx = r.read_int32()
-            _on_num = r.read_int32()
-            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"
+            on_num = r.read_int32()
+            entry.object_name = resolve_fname(self.name_map, on_idx, on_num)
 
             entry.object_flags = r.read_uint32()
 
@@ -446,10 +446,13 @@ class Package:
 
             self.exports.append(entry)
 
-    def resolve_fname(self, index: int) -> str:
-        if 0 <= index < len(self.name_map):
-            return self.name_map[index]
-        return f"#{index}"
+    def resolve_fname(self, index: int, number: int = 0) -> str:
+        """Resolve an FName against this package's name table.
+
+        *number* carries the ``_N`` suffix UE stores outside the table; leave
+        it at 0 only for names read from a context that has none.
+        """
+        return resolve_fname(self.name_map, index, number)
 
     def get_export_class_name(self, export_index: int) -> str:
         if export_index < 0 or export_index >= len(self.exports):

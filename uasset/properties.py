@@ -3,7 +3,7 @@
 Handles both old format (UE4 style) and new format (UE5 >= PROPERTY_TAG_COMPLETE_TYPE_NAME).
 Provides both skip_properties (for mesh/texture parsing) and read_properties (for umap parsing).
 """
-from .reader import BinaryReader
+from .reader import BinaryReader, resolve_fname
 from .package import (
     UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME,
     UE5_PROPERTY_TAG_EXTENSION,
@@ -26,9 +26,9 @@ def _read_property_type_name(r: BinaryReader, name_map):
     i = 0
     while i < total_nodes:
         idx = r.read_int32()
-        _num = r.read_int32()  # FName number
+        num = r.read_int32()  # FName number
         inner_count = r.read_int32()
-        name = name_map[idx] if 0 <= idx < len(name_map) else f"#{idx}"
+        name = resolve_fname(name_map, idx, num)
         if i == 0:
             type_name = name
         total_nodes += inner_count
@@ -47,9 +47,9 @@ def _read_property_type_tree(r: BinaryReader, name_map):
     i = 0
     while i < total_nodes:
         idx = r.read_int32()
-        _num = r.read_int32()
+        num = r.read_int32()
         inner_count = r.read_int32()
-        name = name_map[idx] if 0 <= idx < len(name_map) else f"#{idx}"
+        name = resolve_fname(name_map, idx, num)
         names.append(name)
         total_nodes += inner_count
         i += 1
@@ -111,8 +111,8 @@ def read_property_tag(reader: BinaryReader, name_map,
         return None
 
     name_idx = reader.read_int32()
-    _name_num = reader.read_int32()
-    name = name_map[name_idx] if 0 <= name_idx < len(name_map) else f"#{name_idx}"
+    name_num = reader.read_int32()
+    name = resolve_fname(name_map, name_idx, name_num)
     if name == "None":
         return None
 
@@ -128,8 +128,8 @@ def read_property_tag(reader: BinaryReader, name_map,
     # Old format: FName type + Size + ArrayIndex + type-specific header, with
     # HasPropertyGuid ahead of the value data rather than after it.
     type_idx = reader.read_int32()
-    _type_num = reader.read_int32()
-    type_name = name_map[type_idx] if 0 <= type_idx < len(name_map) else f"#{type_idx}"
+    type_num = reader.read_int32()
+    type_name = resolve_fname(name_map, type_idx, type_num)
 
     size = reader.read_int32()
     array_index = reader.read_int32()
@@ -138,17 +138,15 @@ def read_property_tag(reader: BinaryReader, name_map,
     bool_value = False
     if type_name == "StructProperty":
         struct_idx = reader.read_int32()
-        _struct_num = reader.read_int32()
-        inner_types = [name_map[struct_idx] if 0 <= struct_idx < len(name_map)
-                       else f"#{struct_idx}"]
+        struct_num = reader.read_int32()
+        inner_types = [resolve_fname(name_map, struct_idx, struct_num)]
         reader.skip(16)  # StructGuid
     elif type_name == "BoolProperty":
         bool_value = reader.read_uint8() != 0
     elif type_name in ("ByteProperty", "EnumProperty"):
         enum_idx = reader.read_int32()
-        _enum_num = reader.read_int32()
-        inner_types = [name_map[enum_idx] if 0 <= enum_idx < len(name_map)
-                       else f"#{enum_idx}"]
+        enum_num = reader.read_int32()
+        inner_types = [resolve_fname(name_map, enum_idx, enum_num)]
     elif type_name in ("ArrayProperty", "SetProperty"):
         reader.skip(8)   # InnerType FName
     elif type_name == "MapProperty":
@@ -290,8 +288,8 @@ def _read_typed_value(reader: BinaryReader, type_name: str, size: int, name_map)
 
     elif type_name == "NameProperty" and size >= 8:
         idx = reader.read_int32()
-        _num = reader.read_int32()
-        return name_map[idx] if 0 <= idx < len(name_map) else f"#{idx}"
+        num = reader.read_int32()
+        return resolve_fname(name_map, idx, num)
 
     elif type_name == "StrProperty" and size > 0:
         return reader.read_fstring()
@@ -331,8 +329,8 @@ def skip_properties(reader: BinaryReader, name_map, file_version_ue5: int) -> in
 
         # Read property name (FName: index + number)
         name_idx = reader.read_int32()
-        _name_num = reader.read_int32()
-        name = name_map[name_idx] if 0 <= name_idx < len(name_map) else f"#{name_idx}"
+        name_num = reader.read_int32()
+        name = resolve_fname(name_map, name_idx, name_num)
 
         if name == "None":
             break
@@ -368,8 +366,8 @@ def skip_properties(reader: BinaryReader, name_map, file_version_ue5: int) -> in
         else:
             # Old format: FName type + Size + ArrayIndex + type-specific header
             type_idx = reader.read_int32()
-            _type_num = reader.read_int32()
-            type_name = name_map[type_idx] if 0 <= type_idx < len(name_map) else f"#{type_idx}"
+            type_num = reader.read_int32()
+            type_name = resolve_fname(name_map, type_idx, type_num)
 
             size = reader.read_int32()
             _array_index = reader.read_int32()
@@ -435,8 +433,8 @@ def read_properties(reader: BinaryReader, name_map, file_version_ue5: int) -> di
 
         # Read property name (FName: index + number)
         name_idx = reader.read_int32()
-        _name_num = reader.read_int32()
-        name = name_map[name_idx] if 0 <= name_idx < len(name_map) else f"#{name_idx}"
+        name_num = reader.read_int32()
+        name = resolve_fname(name_map, name_idx, name_num)
 
         if name == "None":
             break
@@ -505,8 +503,8 @@ def _read_property_old(reader: BinaryReader, name_map, name: str, props: dict):
     """
     # Type FName (8 bytes)
     type_idx = reader.read_int32()
-    _type_num = reader.read_int32()
-    type_name = name_map[type_idx] if 0 <= type_idx < len(name_map) else f"#{type_idx}"
+    type_num = reader.read_int32()
+    type_name = resolve_fname(name_map, type_idx, type_num)
 
     size = reader.read_int32()
     _array_index = reader.read_int32()
@@ -515,8 +513,8 @@ def _read_property_old(reader: BinaryReader, name_map, name: str, props: dict):
     if type_name == "StructProperty":
         # StructName FName (8 bytes) + StructGuid (16 bytes)
         struct_idx = reader.read_int32()
-        _struct_num = reader.read_int32()
-        struct_name = name_map[struct_idx] if 0 <= struct_idx < len(name_map) else f"#{struct_idx}"
+        struct_num = reader.read_int32()
+        struct_name = resolve_fname(name_map, struct_idx, struct_num)
         reader.skip(16)  # StructGuid (matches skip_properties)
 
         # HasPropertyGuid
@@ -550,8 +548,8 @@ def _read_property_old(reader: BinaryReader, name_map, name: str, props: dict):
         value_start = reader.position()
         if type_name == "EnumProperty" and size >= 8:
             enum_idx = reader.read_int32()
-            _enum_num = reader.read_int32()
-            value = name_map[enum_idx] if 0 <= enum_idx < len(name_map) else f"#{enum_idx}"
+            enum_num = reader.read_int32()
+            value = resolve_fname(name_map, enum_idx, enum_num)
         else:
             value = reader.read_bytes(size)
         remaining = size - (reader.position() - value_start)

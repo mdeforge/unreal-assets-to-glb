@@ -4,6 +4,22 @@ from io import BytesIO
 from typing import Union, List, Callable, Optional
 
 
+def resolve_fname(name_map: List[str], index: int, number: int) -> str:
+    """Render an FName — a name-table index plus a *number* — as UE prints it.
+
+    A trailing ``_N`` is stored out of band rather than in the name table:
+    ``MI_SpaceShip_1`` is the entry ``MI_SpaceShip`` carrying number 2, and
+    ``FName::ToString`` appends ``_(number - 1)`` whenever the number is
+    non-zero.  Every numbered sibling therefore shares one table entry, so
+    dropping the number silently collapses ``MI_SpaceShip_1``,
+    ``MI_SpaceShip_2`` and ``MI_SpaceShip_3`` into a single name — and a mesh
+    with one slot per material ends up resolving all three to whichever asset
+    is found first.
+    """
+    base = name_map[index] if 0 <= index < len(name_map) else f"#{index}"
+    return f"{base}_{number - 1}" if number else base
+
+
 class BinaryReader:
     """Wraps a byte stream with typed read methods for UE binary formats."""
 
@@ -98,9 +114,7 @@ class BinaryReader:
     def read_fname(self, name_map: List[str]) -> str:
         index = self.read_int32()
         number = self.read_int32()
-        if 0 <= index < len(name_map):
-            return name_map[index]
-        return f"#{index}"
+        return resolve_fname(name_map, index, number)
 
     def read_tarray(self, func: Callable) -> list:
         count = self.read_int32()
