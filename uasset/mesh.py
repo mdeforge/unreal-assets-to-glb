@@ -5,7 +5,7 @@ Pipeline: .uasset → Package → Trailer → FCompressedBuffer → Oodle decomp
 """
 import os
 import struct
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, NamedTuple, Tuple, Optional
 
 import numpy as np
 import ooz
@@ -983,6 +983,66 @@ def ue_matrix_to_gltf(matrix: np.ndarray,
     return [float(v) for v in converted.T.flatten()]
 
 
+class MaterialSpec(NamedTuple):
+    """One material slot's appearance, as the GLB writer wants it.
+
+    A plain ``(material_index, pixels, key)`` tuple still works wherever this
+    is accepted — the extra fields default to an opaque, untinted material —
+    so callers that only have a texture need not build one of these.
+    """
+    material_index: int
+    pixels: object = None
+    texture_key: Optional[str] = None
+    factor: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
+    alpha_mode: str = 'OPAQUE'
+    alpha_cutoff: Optional[float] = None
+
+
+def _as_rgba(pixels) -> np.ndarray:
+    """A base-colour array as RGBA, whatever channel count it arrives with."""
+    array = np.asarray(pixels)
+    if array.ndim == 2:                       # greyscale
+        array = np.stack([array] * 3, axis=-1)
+    if array.shape[2] == 4:
+        return array
+    if array.shape[2] == 3:
+        alpha = np.full(array.shape[:2] + (1,), 255, dtype=array.dtype)
+        return np.concatenate([array, alpha], axis=2)
+    raise ValueError(f"unsupported base-colour channel count {array.shape[2]}")
+
+
+def _check_import_contract(mat, base_color_image) -> None:
+    """Assert the two invariants that fail *silently* in the importer.
+
+    Both are multiplicative-identity traps on the consuming side: the asset
+    loads, renders, and merely looks wrong, so nothing downstream can catch
+    them and they have to be caught here.
+
+    1. A non-opaque material's base-colour image must be RGBA.  The importer
+       decodes at the file's native channel count and pads 3-channel data to
+       RGBA with alpha 0xFF, so an RGB image on a ``BLEND`` material loads
+       fully opaque.
+    2. ``emissiveFactor`` must be non-zero wherever ``emissiveTexture`` is set.
+       The shader computes ``emissive = factor.rgb; if (tex) emissive *= tex``,
+       and glTF defaults the factor to ``[0, 0, 0]`` — which multiplies any
+       emissive texture to nothing.
+    """
+    alpha_mode = getattr(mat, 'alphaMode', None) or 'OPAQUE'
+    if alpha_mode != 'OPAQUE' and base_color_image is not None:
+        if base_color_image.mode != 'RGBA':
+            raise AssertionError(
+                f"base-colour image for a {alpha_mode} material is "
+                f"{base_color_image.mode}, not RGBA — it would import as fully "
+                f"opaque")
+
+    if getattr(mat, 'emissiveTexture', None) is not None:
+        factor = getattr(mat, 'emissiveFactor', None)
+        if not factor or not any(factor):
+            raise AssertionError(
+                "emissiveTexture is set but emissiveFactor is zero/default — "
+                "the texture would multiply to zero and be invisible")
+
+
 class _GLBBuilder:
     """Accumulates meshes, materials and textures into one glTF binary blob.
 
@@ -1085,18 +1145,47 @@ class _GLBBuilder:
         # Build texture lookup  material_index -> (PIL.Image, identity)
         # An optional third tuple element identifies the texture, letting the
         # same pixels be embedded once and shared by every material using it.
+        # A spec may carry no pixels at all: a glass material's colour is a
+        # constant, and it still needs its factor and blend mode.
         texture_lookup: dict = {}
+        spec_lookup: dict = {}
         if textures:
             for item in textures:
-                mat_idx, tex_data = item[0], item[1]
-                identity = item[2] if len(item) > 2 else None
+                spec = (item if isinstance(item, MaterialSpec)
+                        else MaterialSpec(*item))
+                mat_idx, tex_data = spec.material_index, spec.pixels
+                spec_lookup[mat_idx] = spec
+                identity = spec.texture_key
                 if isinstance(tex_data, np.ndarray):
-                    if tex_data.ndim == 3 and tex_data.shape[2] == 4:
-                        image = PILImage.fromarray(tex_data, 'RGBA')
+                    array = tex_data
+                    # A non-opaque material must reach the importer as RGBA:
+                    # 3-channel data is padded with alpha 0xFF downstream, so
+                    # a BLEND material silently loads fully opaque.  Opacity is
+                    # composited here because the contract has no separate slot.
+                    if spec.alpha_mode != 'OPAQUE':
+                        array = _as_rgba(array)
+                        if spec.factor[3] < 1.0:
+                            array = array.copy()
+                            array[..., 3] = (array[..., 3].astype(np.float32)
+                                             * spec.factor[3]).astype(array.dtype)
+                            # These pixels are no longer the texture as stored,
+                            # so they need their own identity — otherwise two
+                            # materials sharing a texture at different opacities
+                            # would dedupe onto whichever was written first.
+                            if identity is not None:
+                                identity = (identity, round(spec.factor[3], 4))
+                        spec = spec._replace(
+                            factor=spec.factor[:3] + (1.0,),
+                            texture_key=identity)
+                        spec_lookup[mat_idx] = spec
+                    if array.ndim == 3 and array.shape[2] == 4:
+                        image = PILImage.fromarray(array, 'RGBA')
                     else:
-                        image = PILImage.fromarray(tex_data)
+                        image = PILImage.fromarray(array)
                 elif hasattr(tex_data, 'save'):  # PIL.Image already
                     image = tex_data
+                    if spec.alpha_mode != 'OPAQUE' and image.mode != 'RGBA':
+                        image = image.convert('RGBA')
                 else:
                     continue
                 texture_lookup[mat_idx] = (image, identity)
@@ -1108,11 +1197,19 @@ class _GLBBuilder:
         mat_idx_to_gltf_mat: dict = {}
 
         for mat_idx in sorted_mat_indices:
+            spec = spec_lookup.get(mat_idx, MaterialSpec(mat_idx))
             mat = Material()
             mat.pbrMetallicRoughness = PbrMetallicRoughness()
-            mat.pbrMetallicRoughness.baseColorFactor = [1.0, 1.0, 1.0, 1.0]
+            mat.pbrMetallicRoughness.baseColorFactor = list(spec.factor)
             mat.pbrMetallicRoughness.metallicFactor = 0.0
             mat.pbrMetallicRoughness.roughnessFactor = 1.0
+            if spec.alpha_mode != 'OPAQUE':
+                mat.alphaMode = spec.alpha_mode
+                if spec.alpha_mode == 'MASK' and spec.alpha_cutoff is not None:
+                    mat.alphaCutoff = spec.alpha_cutoff
+                # Both sides of a translucent surface are visible in UE, and a
+                # cutout leaf is meaningless backface-culled.
+                mat.doubleSided = True
 
             if mat_idx in texture_lookup:
                 pil_img, identity = texture_lookup[mat_idx]
@@ -1144,6 +1241,8 @@ class _GLBBuilder:
                 tex_info.texCoord = 0
                 mat.pbrMetallicRoughness.baseColorTexture = tex_info
 
+            _check_import_contract(mat, pil_img if mat_idx in texture_lookup
+                                   else None)
             self.materials.append(mat)
             mat_idx_to_gltf_mat[mat_idx] = len(self.materials) - 1
 

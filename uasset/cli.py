@@ -14,7 +14,7 @@ import numpy as np
 from tqdm import tqdm
 
 from uasset.package import Package
-from uasset.mesh import StaticMesh, export_glb, _UE_TO_GLTF_SCALE
+from uasset.mesh import StaticMesh, MaterialSpec, export_glb, _UE_TO_GLTF_SCALE
 import pickle
 import hashlib
 from uasset.texture import Texture2D, export_png
@@ -22,8 +22,8 @@ from uasset.properties import read_properties
 from uasset.scene import (
     _build_uasset_index,
     _get_material_names_from_mesh,
-    _get_base_color_texture_from_material,
     package_path_for_file,
+    resolve_material_appearance,
 )
 
 
@@ -146,19 +146,43 @@ def assign_texture_filenames(textures):
     return stems
 
 
-def resolve_mesh_textures(mesh, name, uasset_index, tex_name_map, texture_cache):
-    """Resolve a base-colour texture for each of a mesh's polygon groups.
+def resolve_mesh_textures(mesh, name, uasset_index, tex_name_map, texture_cache,
+                          warn=None):
+    """Resolve each of a mesh's polygon groups to a :class:`MaterialSpec`.
 
     Each polygon group carries an ``ImportedMaterialSlotName`` which maps to a
     concrete material through the ``StaticMaterials`` array, via
     ``SectionInfoMap``.  Where that data is missing the polygon group index is
     assumed to be the material import index.
 
-    Returns ``[(material_index, pixels, texture_key), ...]``.  The key is the
-    texture's package path, which lets a level GLB embed shared textures once
-    instead of once per mesh that uses them.
+    A spec is produced for every slot that resolves to a material, whether or
+    not it has a texture: a glass material's colour is a constant, and its
+    blend mode has to travel even when there are no pixels.  The texture key is
+    the texture's package path, which lets a level GLB embed shared textures
+    once instead of once per mesh that uses them.
+
+    *warn* is called with a one-line message for anything that would otherwise
+    be wrong-but-silent downstream.
     """
-    mesh_textures = []
+    specs = []
+    seen_notes = set()
+
+    def spec_for(index, mat_name):
+        appearance = resolve_material_appearance(
+            mat_name, uasset_index, tex_name_map)
+        for note in appearance.notes:
+            key = (mat_name, note)
+            if warn is not None and key not in seen_notes:
+                seen_notes.add(key)
+                warn(f"  {name}: material '{mat_name}' {note}")
+        pixels = (texture_cache.get(appearance.texture)
+                  if appearance.texture else None)
+        if pixels is None and appearance.alpha_mode == 'OPAQUE' \
+                and appearance.factor == (1.0, 1.0, 1.0, 1.0):
+            return None          # nothing to say about this slot
+        return MaterialSpec(index, pixels, appearance.texture,
+                            appearance.factor, appearance.alpha_mode,
+                            appearance.alpha_cutoff)
 
     if mesh.material_slots and mesh.material_slot_names:
         section_map = getattr(mesh, 'section_info_map', None)
@@ -175,21 +199,17 @@ def resolve_mesh_textures(mesh, name, uasset_index, tex_name_map, texture_cache)
                 mat_name = None
             if mat_name is None:
                 continue
-            tex_name = _get_base_color_texture_from_material(
-                mat_name, uasset_index, tex_name_map)
-            if tex_name and tex_name in texture_cache:
-                mesh_textures.append(
-                    (pg_idx, texture_cache[tex_name], tex_name))
+            spec = spec_for(pg_idx, mat_name)
+            if spec is not None:
+                specs.append(spec)
     else:
         material_names = _get_material_names_from_mesh(name, uasset_index)
         for mat_idx, mat_name in enumerate(material_names):
-            tex_name = _get_base_color_texture_from_material(
-                mat_name, uasset_index, tex_name_map)
-            if tex_name and tex_name in texture_cache:
-                mesh_textures.append(
-                    (mat_idx, texture_cache[tex_name], tex_name))
+            spec = spec_for(mat_idx, mat_name)
+            if spec is not None:
+                specs.append(spec)
 
-    return mesh_textures
+    return specs
 
 
 class ExportContext:
@@ -359,7 +379,8 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None,
             mesh = StaticMesh.from_package(pkg)
             if mesh and mesh.vertices:
                 mesh_textures = resolve_mesh_textures(
-                    mesh, name, uasset_index, tex_name_map, texture_cache)
+                    mesh, name, uasset_index, tex_name_map, texture_cache,
+                    warn=tqdm.write)
                 glb_path = os.path.join(export_dir, "Meshes", f"{name}.glb")
                 export_glb(mesh, glb_path,
                            textures=mesh_textures if mesh_textures else None,
@@ -421,7 +442,7 @@ def export_level(input_dir, export_dir, umap_filename, context,
                 continue
             textures = resolve_mesh_textures(
                 mesh, mesh_name, context.uasset_index, context.tex_name_map,
-                context.texture_cache)
+                context.texture_cache, warn=tqdm.write)
             meshes[mesh_name] = (mesh, textures)
         except Exception as e:
             tqdm.write(f"  {mesh_name}: ERROR {e}")

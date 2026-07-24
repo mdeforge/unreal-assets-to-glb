@@ -19,14 +19,14 @@ import os
 import struct
 import logging
 from collections import deque
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, NamedTuple, Tuple
 
 from .package import Package, UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME
 from .properties import (
     PropertyTag, end_property_tag, has_serialization_control_byte,
     read_property_tag,
 )
-from .reader import BinaryReader
+from .reader import BinaryReader, resolve_fname
 
 logger = logging.getLogger(__name__)
 
@@ -253,11 +253,16 @@ def _iter_object_array(pkg: Package, value: bytes) -> List[int]:
 
 
 def _read_fname_value(pkg: Package, value: bytes) -> Optional[str]:
-    """Resolve a property value that holds an FName."""
+    """Resolve a property value that holds an FName.
+
+    The number half of the pair carries any ``_N`` suffix, so a parameter
+    called ``Texture_1`` is only distinguishable from ``Texture`` once it is
+    read as well.
+    """
     idx = _read_int32(value)
     if idx is None or not 0 <= idx < len(pkg.name_map):
         return None
-    return pkg.name_map[idx]
+    return resolve_fname(pkg.name_map, idx, _read_int32(value, 4) or 0)
 
 
 def _find_material_instance_export(pkg: Package) -> Optional[int]:
@@ -424,10 +429,10 @@ def _build_uasset_index(input_dir: str) -> Dict[str, str]:
 
     The key is the *object name* of each export flagged ``bIsAsset`` in the
     package — the name other packages use to import it.  It is not the file
-    name: ``MI_SpaceShip_1.uasset`` can perfectly well contain an asset called
-    ``MI_SpaceShip``, and a mesh importing that material refers to it by the
-    latter.  File names are registered too, but only for names no package
-    claimed, so unparsable packages stay reachable.
+    name: a World Partition external actor lives in a package with a generated
+    name, so ``4R5KVGUQV9EML9A63KFY9E.uasset`` holds an actor called
+    ``StaticMeshActor_UAID_…``.  File names are registered too, but only for
+    names no package claimed, so unparsable packages stay reachable.
 
     Where several packages export the same asset name, the lexicographically
     first path wins so that repeated runs resolve identically.
@@ -545,7 +550,8 @@ def _lookup_texture(tex_map: Dict[str, str], name: str) -> Optional[str]:
 
 def _get_base_color_texture_from_material(material_name: str,
                                           uasset_index: Dict[str, str],
-                                          tex_map: Dict[str, str]
+                                          tex_map: Dict[str, str],
+                                          graph: Optional['_MaterialGraph'] = None
                                           ) -> Optional[str]:
     """Resolve a base-colour texture by walking the material parent chain.
 
@@ -567,11 +573,13 @@ def _get_base_color_texture_from_material(material_name: str,
         material_name:  Material asset name.
         uasset_index:   Index from :func:`_build_uasset_index`.
         tex_map:        Mapping of texture asset name → exported name / identifier.
+        graph:          Reuse an open :class:`_MaterialGraph` rather than
+                        re-reading every package this walk touches.
 
     Returns:
         The resolved texture name from *tex_map*, or ``None``.
     """
-    graph = _MaterialGraph(uasset_index)
+    graph = graph if graph is not None else _MaterialGraph(uasset_index)
     overrides: Dict[ParameterKey, str] = {}
     samplers: List[Sampler] = []
     layers: List[str] = []
@@ -672,6 +680,275 @@ def _lookup_override(overrides: Dict[ParameterKey, str],
     return None
 
 
+# ---------------------------------------------------------------------------
+# Blend mode / opacity → glTF alpha
+# ---------------------------------------------------------------------------
+
+# EBlendMode → glTF alphaMode.  Everything that is not opaque and not a
+# threshold cutout blends; glTF has no additive or modulate mode.
+_ALPHA_MODE_BY_BLEND = {
+    'BLEND_Opaque': 'OPAQUE',
+    'BLEND_Masked': 'MASK',
+    'BLEND_Translucent': 'BLEND',
+    'BLEND_Additive': 'BLEND',
+    'BLEND_Modulate': 'BLEND',
+    'BLEND_AlphaComposite': 'BLEND',
+    'BLEND_AlphaHoldout': 'BLEND',
+    'BLEND_TranslucentColoredTransmittance': 'BLEND',
+}
+
+# UE's default for OpacityMaskClipValue, and glTF's default alphaCutoff.
+_DEFAULT_MASK_CLIP = 0.3333
+
+
+class MaterialAppearance(NamedTuple):
+    """What the GLB writer needs to reproduce a material's base colour.
+
+    ``texture`` is the base-colour map (a *tex_map* value) or None; ``factor``
+    is glTF ``baseColorFactor``, which multiplies it exactly as UE's tint
+    multiply does.  ``alpha_mode``/``alpha_cutoff`` carry the blend mode.
+    ``notes`` is what the export loop should print — a non-opaque material
+    whose opacity could not be pinned down is the case that otherwise fails
+    silently downstream.
+    """
+    texture: Optional[str] = None
+    factor: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
+    alpha_mode: str = 'OPAQUE'
+    alpha_cutoff: Optional[float] = None
+    notes: Tuple[str, ...] = ()
+
+
+def _read_float(value: bytes, offset: int = 0) -> Optional[float]:
+    if len(value) < offset + 4:
+        return None
+    return struct.unpack_from('<f', value, offset)[0]
+
+
+def _read_linear_color(value: bytes
+                       ) -> Optional[Tuple[float, float, float, float]]:
+    """An FLinearColor value: four floats, serialized natively."""
+    if len(value) < 16:
+        return None
+    return struct.unpack_from('<4f', value, 0)
+
+
+def _base_property_override(pkg: Package, export_index: int, name: str):
+    """Read one FMaterialInstanceBasePropertyOverrides member, if it is active.
+
+    UE keeps a ``bOverride_<name>`` flag beside every member and ignores the
+    value unless the flag is set — an instance that merely inherited
+    ``BLEND_Masked`` from its parent still serializes a stale ``BlendMode``
+    here.  Honouring the value without the flag would invent overrides.
+    """
+    entry = _find_prop(_read_export_properties(pkg, export_index),
+                       'BasePropertyOverrides', 'StructProperty')
+    if entry is None:
+        return None
+    inner = _read_tagged_block(BinaryReader(entry[1]), pkg.name_map,
+                               pkg.file_version_ue5)
+    flag = _find_prop(inner, f'bOverride_{name}', 'BoolProperty')
+    if flag is None or not flag[0].bool_value:
+        return None
+    return _find_prop(inner, name)
+
+
+def _material_alpha(material_name: str, graph: '_MaterialGraph'
+                    ) -> Tuple[str, Optional[float]]:
+    """Resolve ``(alphaMode, alphaCutoff)`` for a material.
+
+    Walks the same parent chain the texture resolution does: an instance's
+    active BasePropertyOverrides win, otherwise the master Material's own
+    BlendMode applies.
+    """
+    name: Optional[str] = material_name
+    visited = set()
+    blend = None
+    clip = None
+
+    while name is not None and name not in visited and len(visited) <= 8:
+        visited.add(name)
+        pkg = graph.package(name)
+        if pkg is None:
+            break
+
+        index = _find_parameter_export(pkg)
+        if index is not None:
+            if blend is None:
+                over = _base_property_override(pkg, index, 'BlendMode')
+                if over is not None and len(over[1]) >= 8:
+                    blend = _read_fname_value(pkg, over[1])
+            if clip is None:
+                over = _base_property_override(pkg, index,
+                                               'OpacityMaskClipValue')
+                if over is not None:
+                    clip = _read_float(over[1])
+
+        for i in range(pkg.export_count):
+            if pkg.get_export_class_name(i) != 'Material':
+                continue
+            props = _read_export_properties(pkg, i)
+            if blend is None:
+                entry = _find_prop(props, 'BlendMode')
+                if entry is not None and len(entry[1]) >= 8:
+                    blend = _read_fname_value(pkg, entry[1])
+            if clip is None:
+                entry = _find_prop(props, 'OpacityMaskClipValue',
+                                   'FloatProperty')
+                if entry is not None:
+                    clip = _read_float(entry[1])
+            break
+
+        name = _find_parent_material_name(pkg, name)
+
+    mode = _ALPHA_MODE_BY_BLEND.get(blend or 'BLEND_Opaque', 'OPAQUE')
+    if mode != 'MASK':
+        return mode, None
+    return mode, clip if clip is not None else _DEFAULT_MASK_CLIP
+
+
+def _constant_from(pkg: Package, root: Optional[int], graph: '_MaterialGraph'):
+    """The first constant colour or scalar an input reaches.
+
+    Returns ``(rgba, scalar)`` — a colour expression fills the first, a scalar
+    one the second, and the parameter name comes back with each so an instance
+    override can replace it.  Only the nodes that *are* constants terminate the
+    walk; anything else is followed through.
+    """
+    queue = deque([(root, 0)])
+    visited = set()
+    color = scalar = None
+
+    while queue and len(visited) < _MAX_EXPRESSION_NODES:
+        index, depth = queue.popleft()
+        if not index or index <= 0 or index in visited:
+            continue
+        visited.add(index)
+        exp_idx = index - 1
+        if not 0 <= exp_idx < len(pkg.exports):
+            continue
+
+        class_name = pkg.get_export_class_name(exp_idx)
+        props = _read_export_properties(pkg, exp_idx)
+        param = _find_prop(props, 'ParameterName', 'NameProperty')
+        param_name = _read_fname_value(pkg, param[1]) if param else None
+
+        if class_name in ('MaterialExpressionVectorParameter',
+                          'MaterialExpressionConstant3Vector',
+                          'MaterialExpressionConstant4Vector'):
+            entry = (_find_prop(props, 'DefaultValue', 'StructProperty')
+                     or _find_prop(props, 'Constant', 'StructProperty'))
+            rgba = _read_linear_color(entry[1]) if entry else None
+            if color is None:
+                color = (rgba, param_name)
+        elif class_name in ('MaterialExpressionScalarParameter',
+                            'MaterialExpressionConstant'):
+            entry = (_find_prop(props, 'DefaultValue', 'FloatProperty')
+                     or _find_prop(props, 'R', 'FloatProperty'))
+            value = _read_float(entry[1]) if entry else None
+            if scalar is None:
+                scalar = (value, param_name)
+
+        for child, _masked in _expression_inputs(pkg, props):
+            queue.append((child, depth + 1))
+
+    return color, scalar
+
+
+def _material_input_root(pkg: Package, input_name: str):
+    """The expression a named material output reads, with its channel mask."""
+    for i in range(pkg.export_count):
+        if pkg.get_export_class_name(i) != 'MaterialEditorOnlyData':
+            continue
+        entry = _find_prop(_read_export_properties(pkg, i), input_name,
+                           'StructProperty')
+        if entry is None:
+            return None, False
+        return read_expression_input(entry[1])
+    return None, False
+
+
+def resolve_material_appearance(material_name: str,
+                                uasset_index: Dict[str, str],
+                                tex_map: Dict[str, str]) -> MaterialAppearance:
+    """Resolve a material to the glTF base-colour fields that describe it.
+
+    Three things come out of the material rather than one, because glTF splits
+    what UE keeps in a single graph: the base-colour *map*, the constant
+    *factor* that multiplies it, and the blend mode.  UE's
+    ``BaseColor = Tint * Texture`` is exactly glTF's
+    ``baseColorFactor * baseColorTexture``, so a tint that used to be dropped
+    now survives the trip.
+
+    Opacity is the part that does not translate cleanly: UE evaluates it per
+    pixel (fresnel, lerps), glTF wants one number or a texture channel.  A
+    constant is used where the graph offers one, and anything less certain is
+    reported in ``notes`` rather than guessed at silently.
+    """
+    graph = _MaterialGraph(uasset_index)
+    texture = _get_base_color_texture_from_material(
+        material_name, uasset_index, tex_map, graph)
+    alpha_mode, alpha_cutoff = _material_alpha(material_name, graph)
+
+    # Constant colour / opacity live on the master's graph; the instances above
+    # it supply the parameter values that replace their defaults.
+    color = scalar = None
+    name: Optional[str] = material_name
+    visited = set()
+    vector_overrides: Dict[str, Tuple[float, float, float, float]] = {}
+    scalar_overrides: Dict[str, float] = {}
+
+    while name is not None and name not in visited and len(visited) <= 8:
+        visited.add(name)
+        pkg = graph.package(name)
+        if pkg is None:
+            break
+        for key, value in _parse_parameter_values(
+                pkg, 'VectorParameterValues', 'StructProperty'):
+            rgba = _read_linear_color(value)
+            if rgba is not None:
+                vector_overrides.setdefault(key[0], rgba)
+        for param, value in _parse_scalar_parameter_values(pkg).items():
+            scalar_overrides.setdefault(param, value)
+
+        if color is None:
+            root, masked = _material_input_root(pkg, 'BaseColor')
+            if root and not masked:
+                color, _ = _constant_from(pkg, root, graph)
+        if scalar is None and alpha_mode == 'BLEND':
+            root, _masked = _material_input_root(pkg, 'Opacity')
+            if root:
+                _, scalar = _constant_from(pkg, root, graph)
+        name = _find_parent_material_name(pkg, name)
+
+    notes: List[str] = []
+
+    rgb = (1.0, 1.0, 1.0)
+    if color is not None:
+        rgba, param_name = color
+        if param_name and param_name in vector_overrides:
+            rgba = vector_overrides[param_name]
+        if rgba is not None:
+            rgb = tuple(max(0.0, min(1.0, c)) for c in rgba[:3])
+
+    alpha = 1.0
+    if alpha_mode == 'BLEND':
+        if scalar is not None:
+            value, param_name = scalar
+            if param_name and param_name in scalar_overrides:
+                value = scalar_overrides[param_name]
+            if value is not None:
+                alpha = max(0.0, min(1.0, value))
+            else:
+                notes.append('opacity constant unreadable, using 1.0')
+        else:
+            notes.append('translucent but opacity is not a constant, using 1.0')
+
+    logger.debug(f"Material '{material_name}': texture={texture} rgb={rgb} "
+                 f"alpha={alpha} mode={alpha_mode} cutoff={alpha_cutoff}")
+    return MaterialAppearance(texture, rgb + (alpha,), alpha_mode,
+                              alpha_cutoff, tuple(notes))
+
+
 def _get_layer_base_color_samplers(layer_name: str,
                                    graph: '_MaterialGraph') -> List[Sampler]:
     """Samplers feeding the base colour of one material layer.
@@ -738,7 +1015,8 @@ def _get_base_color_samplers(pkg: Package,
         if entry is None or entry[0].struct_name not in _EXPRESSION_INPUT_STRUCTS:
             continue
         # FMaterialInput opens with the Expression FPackageIndex.
-        samplers = graph.samplers_from(pkg, _read_int32(entry[1]))
+        index, scalar = read_expression_input(entry[1])
+        samplers = graph.samplers_from(pkg, index, scalar)
         if samplers:
             return samplers
 
@@ -771,9 +1049,7 @@ def _read_sampler(pkg: Package,
     parameter = None
     named = _find_prop(props, 'ParameterName', 'NameProperty')
     if named is not None:
-        name_idx = _read_int32(named[1])
-        if name_idx is not None and 0 <= name_idx < len(pkg.name_map):
-            parameter = pkg.name_map[name_idx]
+        parameter = _read_fname_value(pkg, named[1])
 
     if parameter is None and texture is None:
         return None
@@ -817,21 +1093,30 @@ class _MaterialGraph:
             self._packages[asset_name] = package
         return self._packages[asset_name]
 
-    def samplers_from(self, pkg: Package, root: Optional[int]) -> List[Sampler]:
+    def samplers_from(self, pkg: Package, root: Optional[int],
+                      scalar: bool = False) -> List[Sampler]:
         """Collect the samplers reachable from one expression input."""
-        return self._search(deque([(pkg, root, 0)]))
+        return self._search(deque([(pkg, root, 0, scalar)]))
 
     def function_samplers(self, pkg: Package, depth: int = 0) -> List[Sampler]:
         """Collect the samplers a material function's base colour reads."""
         return self._search(deque(
-            (pkg, root, depth) for root in _function_base_color_roots(pkg)))
+            (pkg, root, depth, scalar)
+            for root, scalar in _function_base_color_roots(pkg)))
 
     def _search(self, queue) -> List[Sampler]:
+        """Breadth-first walk collecting samplers that carry a *colour*.
+
+        A sampler reached through a single-channel mask is being read as a
+        number — a blend weight, a roughness, a fresnel term — so its pixels are
+        not an albedo and it is skipped.  The flag is sticky: once an edge has
+        narrowed the signal to one channel, nothing downstream widens it back.
+        """
         visited = set()
         samplers: List[Sampler] = []
 
         while queue and len(visited) < _MAX_EXPRESSION_NODES:
-            pkg, index, depth = queue.popleft()
+            pkg, index, depth, scalar = queue.popleft()
             # Expressions are exports of their own package; a non-positive
             # index means the input is unconnected or refers elsewhere.
             if not index or index <= 0:
@@ -847,20 +1132,22 @@ class _MaterialGraph:
 
             props = _read_export_properties(pkg, exp_idx)
 
-            sampler = _read_sampler(pkg, props)
-            if sampler is not None:
-                samplers.append(sampler)
+            if not scalar:
+                sampler = _read_sampler(pkg, props)
+                if sampler is not None:
+                    samplers.append(sampler)
 
             # A function call continues the search inside the function it
             # names, starting from whatever that function outputs.
             if depth < _MAX_FUNCTION_DEPTH:
                 called = self._called_function(pkg, props)
                 if called is not None:
-                    for root in _function_base_color_roots(called):
-                        queue.append((called, root, depth + 1))
+                    for root, root_scalar in _function_base_color_roots(called):
+                        queue.append((called, root, depth + 1,
+                                      scalar or root_scalar))
 
-            for expression in _expression_inputs(pkg, props):
-                queue.append((pkg, expression, depth))
+            for expression, masked in _expression_inputs(pkg, props):
+                queue.append((pkg, expression, depth, scalar or masked))
 
         return samplers
 
@@ -873,38 +1160,68 @@ class _MaterialGraph:
         return self.package(_resolve_package_index(pkg, _read_int32(entry[1])))
 
 
-def _expression_inputs(pkg: Package,
-                       props: List[TaggedProperty]) -> List[Optional[int]]:
-    """Every expression an node's inputs point at.
+def read_expression_input(value: bytes) -> Tuple[Optional[int], bool]:
+    """Decode an FExpressionInput into ``(expression index, is_scalar)``.
+
+    The struct is native, not tagged: ``Expression`` (FPackageIndex),
+    ``OutputIndex``, ``InputName`` (FName pair), then ``Mask`` and
+    ``MaskR/G/B/A`` — nine int32s.  The mask is what says *which channels* the
+    consumer reads, and it is the difference between a colour and a number: a
+    glass material's ``BaseColor = Tint * T_Statue_M.r`` reads one channel of a
+    packed mask as a scalar multiplier, not as an albedo map.  Treating that
+    texture as the base colour embeds its raw RGB — magenta and white where UE
+    shows near-flat tint.
+
+    *is_scalar* is True when the mask selects exactly one channel.  A mask of 0
+    means "whole output" and is not scalar.
+    """
+    index = _read_int32(value)
+    if len(value) < 36:
+        return index, False
+    mask, r, g, b, a = struct.unpack_from('<5i', value, 16)
+    if not mask:
+        return index, False
+    return index, (bool(r) + bool(g) + bool(b) + bool(a)) == 1
+
+
+def _expression_inputs(pkg: Package, props: List[TaggedProperty]
+                       ) -> List[Tuple[Optional[int], bool]]:
+    """Every expression a node's inputs point at, with each input's mask.
 
     Inputs also hide inside arrays of structs — ``SetMaterialAttributes.Inputs``
     and ``MaterialFunctionCall.FunctionInputs`` both work that way — so those
     are unpacked rather than skipped.
+
+    Each entry is ``(expression index, reached through a single-channel mask)``;
+    see :func:`read_expression_input` for why the mask has to travel with the
+    edge.
     """
-    inputs: List[Optional[int]] = []
+    inputs: List[Tuple[Optional[int], bool]] = []
     for tag, value in props:
         if tag.type_name == 'StructProperty':
             if tag.struct_name in _EXPRESSION_INPUT_STRUCTS:
-                inputs.append(_read_int32(value))
+                inputs.append(read_expression_input(value))
         elif tag.type_name == 'ArrayProperty' and 'StructProperty' in tag.inner_types:
             for element in _iter_struct_array(pkg, value):
                 for inner, inner_value in element:
                     if (inner.type_name == 'StructProperty'
                             and inner.struct_name in _EXPRESSION_INPUT_STRUCTS):
-                        inputs.append(_read_int32(inner_value))
+                        inputs.append(read_expression_input(inner_value))
     return inputs
 
 
-def _function_base_color_roots(pkg: Package) -> List[int]:
+def _function_base_color_roots(pkg: Package) -> List[Tuple[int, bool]]:
     """Where to start searching a material function for its base colour.
 
     A layer function assembles its result with MakeMaterialAttributes, whose
     BaseColor input names the base colour exactly.  Plain functions have no
     such node, so their output expressions are used instead and the search
     covers everything they return.
+
+    Each root is ``(expression index, reached through a single-channel mask)``.
     """
-    roots: List[int] = []
-    outputs: List[int] = []
+    roots: List[Tuple[int, bool]] = []
+    outputs: List[Tuple[int, bool]] = []
 
     for i in range(pkg.export_count):
         class_name = pkg.get_export_class_name(i)
@@ -912,11 +1229,11 @@ def _function_base_color_roots(pkg: Package) -> List[int]:
             entry = _find_prop(_read_export_properties(pkg, i),
                                'BaseColor', 'StructProperty')
             if entry is not None:
-                index = _read_int32(entry[1])
+                index, scalar = read_expression_input(entry[1])
                 if index:
-                    roots.append(index)
+                    roots.append((index, scalar))
         elif class_name in _FUNCTION_OUTPUT_CLASSES:
-            outputs.append(i + 1)
+            outputs.append((i + 1, False))
 
     return roots or outputs
 
