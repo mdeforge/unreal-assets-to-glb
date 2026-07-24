@@ -64,7 +64,7 @@ in the wheel/sdist.
 | `--preview LEVEL.umap` | Parse the level and serve a Three.js preview, assembled live from the per-mesh GLBs |
 | `--preview-glb FILE.glb` | Serve a preview of one already-converted GLB, as written. No project or export needed; ignores `--scale` |
 | `--port N` | Preview port (default `3050`) |
-| `--export-level LEVEL.umap` | Assemble the level into `Export/Levels/<Level>.glb`, actors positioned |
+| `--export-level LEVEL.umap` | Assemble the level into `Export/Levels/<Level>.glb` — actors positioned, plus its lights (`KHR_lights_punctual`) and cameras |
 | `--scale FACTOR` | UE-unit → glTF-unit scale (default `0.01`: UE cm → glTF m). `1.0` keeps centimetres |
 | `--export-dir DIR` | Output directory (default `./Export`) |
 | `--skip-export` | Reuse an existing `Export/` directory |
@@ -112,7 +112,8 @@ Everything lives in the `uasset/` package. Parsing pipeline, roughly:
 | `mesh.py` | `StaticMesh.from_package`, FMeshDescription parsing, `_GLBBuilder` and the `export_glb` / `export_level_glb` writers |
 | `texture.py` | `Texture2D.from_package` (FEditorBulkData source art, Oodle + optional `TSCF_UEDELTA` delta decode), `export_png` |
 | `scene.py` | Asset index (keyed by parsed export object name) and mesh → material → base-color texture resolution: parent-chain walk, `TextureParameterValues` overrides, cross-package BaseColor expression graph, material layers |
-| `umap.py` | `.umap` level parsing: actors, transforms, static-mesh references, level instancing, World Partition external actors |
+| `umap.py` | `.umap` level parsing: actors, transforms, static-mesh references, level instancing, World Partition external actors, and light/camera components (`LevelEmitter`) |
+| `lights.py` | UE light and camera components → `KHR_lights_punctual` and glTF cameras: per-light `ELightUnits` conversion to candela/lux, UE defaults, sRGB + blackbody colour, rect-light encoding |
 | `transform.py` | UE `FRotator`/transform math → matrices for the renderer |
 | `preview_server.py` | stdlib `http.server` on port 3050 (`--port`); serves `preview.html`, a scene JSON, and either `Export/Meshes` + `Export/Textures` (level mode) or one GLB at `/api/model.glb` (`--preview-glb`) |
 | `preview.html` | Three.js viewer (shipped as package data); level mode and GLB mode |
@@ -228,10 +229,13 @@ alpha of 191 with no mask data, and between them they clothe 65 meshes. As `MASK
 cutoff they stay solid, which is correct; as `BLEND` they would turn most of the level 75%
 see-through. Only `T_Bush_D` (alpha 0–255) is a genuine cutout in the sample project.
 
-### The importer contract — two silent failures
+### The importer contract — four silent failures
 
-The GLBs feed an engine whose importer fails *quietly* in two places, so both are asserted at write
-time in `mesh._check_import_contract` rather than left to documentation:
+The GLBs feed an engine (`AxConvert` → Axon) whose importer fails *quietly* in four places. The
+governing rule is **emit spec-standard glTF 2.0 with no accommodations for that engine and no
+pre-tuning of values to look right there**; these four are the exceptions, because a *spec-legal*
+file still imports wrong. All four are asserted at write time — `mesh._check_import_contract` and
+`_GLBBuilder._note_texture_slot` — rather than left to documentation:
 
 1. **A non-opaque material's base-colour image must be RGBA.** The importer decodes at native
    channel count and pads 3-channel data to RGBA with alpha `0xFF`, so an RGB image on a `BLEND`
@@ -243,6 +247,22 @@ time in `mesh._check_import_contract` rather than left to documentation:
    `emissive = factor.rgb; if (tex) emissive *= tex`, and glTF defaults the factor to `[0,0,0]` —
    which multiplies any emissive texture to nothing. Nothing emits `emissiveTexture` today; the
    assert exists so adding it cannot regress.
+3. **`alphaMode` is always written.** Absent means `OPAQUE` and their shader then hard-forces alpha
+   to 1, discarding transparency carried only in texture alpha. pygltflib serializes the field
+   unconditionally, so this holds today; it is listed because it is not free if the writer changes.
+4. **No image is used as both a colour and a data map.** They dedupe by image and the first
+   colour-space classification wins, so an image used as both base-colour/emissive (sRGB) and
+   normal/MR/AO (linear) decodes wrong in one of the two. Only base colour is written today, so
+   `_note_texture_slot` cannot fire yet — it exists so adding a normal or MR map cannot silently
+   reuse a base-colour image.
+
+Also binding, and already true: **one UV set** (everything on `TEXCOORD_0`; they read attribute 0
+and ignore `texCoord`), no `KHR_texture_transform` (bake into UVs), PNG only — no KTX2 — and
+`pbrMetallicRoughness` rather than spec-gloss or unlit. If emissive above 1.0 is ever needed, use
+`KHR_materials_emissive_strength` (normalized factor + strength); `emissiveFactor > 1` is invalid.
+
+Their shader caps at **8 lights**, so a 94-light level renders with the first 8 in scene order. That
+is not an export problem, but it is the usual cause of "the imported level looks unlit".
 
 ### Texture identity
 
@@ -290,6 +310,50 @@ siblings had all collapsed onto one texture each, so the file was small and wron
 composited into a texture's
 alpha (see below) the key gains the opacity value, so two materials sharing a texture at different
 opacities stay distinct instead of silently sharing the first one's pixels.
+
+### Lights and cameras (`lights.py`)
+
+`--export-level` also writes the level's lights as `KHR_lights_punctual` and its cameras as standard
+glTF cameras. Everything goes out in the units the spec asks for — **candela** for point and spot,
+**lux** for directional, **radians** for angles — with no scaling to suit a particular renderer.
+
+- **Collected per component, not per actor.** `umap.parse_level` walks every light and camera
+  *component* and resolves its world transform through the same parent chain the meshes use. A
+  `PointLight` actor holds its component as the root, but `BP_StandLight_C` holds a
+  `RectLightComponent` as one child among several — MainLevel's 11 spot lights exist only inside
+  Blueprints, so per-actor collection would find none of them.
+- **No extra basis correction.** glTF aims lights and cameras down **−Z** with **+Y** up; UE aims
+  them down **+X** with **+Z** up. The mesh axis swap already sends UE +X → glTF −Z and +Z → +Y, so
+  `ue_matrix_to_gltf` is correct unchanged. Scale is dropped: a punctual light has no extent, UE
+  ignores it too (a rect light's `SourceWidth`/`SourceHeight` reach the renderer unscaled), and 8 of
+  this level's lights inherit a 2.47× from the Blueprint placing them.
+- **Intensity units are read per light.** UE stores `ELightUnits` on each component and a level
+  mixes them — MainLevel has 66 Candelas and 28 Unitless. The default is **Unitless**, which is why
+  a deliberately authored candela light always serializes the property. Each conversion mirrors that
+  component's `ComputeLightBrightness()` divided by UE's cm²→m² factor of 100·100: Candelas passes
+  through, Lumens divides by 4π (point), 2π(1−cos θ) (spot) or π (rect), Unitless is the legacy ×16,
+  and EV is `2^EV`.
+- **Colour.** `LightColor` is an sRGB `FColor` (stored B, G, R, A) converted to linear, then
+  multiplied by the blackbody tint when `bUseTemperature` — exactly what
+  `ULightComponent::GetColoredLightBrightness` does. `color_temperature_to_linear` reproduces UE's
+  Planckian-locus approximation coefficient for coefficient. That tint carries unit *luminance*, not
+  unit maximum, so components can exceed 1 (1500 K is `(3.27, 0.43, 0.00)`); the excess is moved into
+  `intensity`, which is exact since a renderer only uses `color × intensity`.
+- **Rect lights have no glTF equivalent** — `KHR_lights_area` was closed in 2023 and never shipped —
+  so the encoding is lossy by necessity. Each becomes a **spot** at the rect centre aimed along its
+  normal with `outerConeAngle = π/2`, `innerConeAngle = 0`: spot because a rect light is one-sided
+  and spot is the only punctual type that says so. Intensity is `Φ/π`, the on-axis intensity of a
+  Lambertian emitter (`Φ = L·A·π`); `Φ/4π` would under-light the forward direction 4×. The full
+  description goes in the **node's `extras`** under the draft proposal's field names (`shape`,
+  `width`, `height`, barn door, source texture) together with the original intensity **and its unit
+  string**, so a real area-light path later is an importer change rather than a re-export. Emissive
+  geometry is deliberately *not* substituted — their renderer has no GI, so it would light nothing.
+- **`zfar` is always written.** glTF treats an absent zfar as an infinite projection, which a
+  consumer then has to invent a number for. UE has no per-camera far plane to copy, so one is derived
+  from the level's bounding-box diagonal and written explicitly; `znear` is UE's `NearClipPlane=10`
+  cm. `yfov` comes from `CurrentHorizontalFOV` and `AspectRatio` — glTF wants a *vertical* fov in
+  radians, UE stores a horizontal one in degrees. Orthographic cameras are reported rather than
+  guessed at, since glTF needs `xmag`/`ymag` that UE's `OrthoWidth` alone does not give.
 
 `ue_matrix_to_gltf` converts a UE world transform into a glTF node matrix. Vertices are already
 baked into glTF axes by `_GLBBuilder`, so a UE transform must be **re-expressed** in that basis
@@ -372,15 +436,26 @@ From `.roo/rules/rule n1.txt` (originally in Russian) — these are binding:
 1. **Never use heuristics based on file name or suffix — parse the `.uasset` file.**
    Asset type, material role, texture channel, etc. must come from parsed package data
    (export class names, property tags), not from `_BC` / `_N` style naming conventions.
-2. The Unreal Engine source is expected at `./UnrealEngine-5.5.0-release` (gitignored) and is the
-   reference for the binary formats. Consult it when a format detail is unclear rather than guessing.
+2. The Unreal Engine source is the reference for the binary formats and for **engine defaults**.
+   Consult it when a detail is unclear rather than guessing. It may be a source checkout at
+   `./UnrealEngine-5.5.0-release` (gitignored), but an installed build works and is what is present
+   here: `C:\Program Files\Epic Games\UE_5.5\Engine\Source\Runtime\...` ships the Runtime `.cpp` as
+   well as the headers, which is where every light constant in `lights.py` came from
+   (`Components/LocalLightComponent.cpp`, `PointLightComponent.cpp`, `SpotLightComponent.cpp`,
+   `RectLightComponent.cpp`, `Engine/Scene.h`, `ColorManagement/ColorSpace.cpp`,
+   `Config/BaseEngine.ini`). A property that a package does not serialize was left at its default,
+   so the default has to come from there — `Intensity` alone defaults to 5000.
 
 ## Scope — deliberately not supported
 
 Do not "fix" these as if they were bugs; they are out of scope by design:
-graph-based/complex material shaders, lights, colliders, PBR texture channels (base color only),
+graph-based/complex material shaders, colliders, PBR texture channels (base color only),
 vertex colors, tangents, LODs, shaders, texture baking, Nanite, animation decompression,
 skeletons/bones. Only **one UV channel** is exported.
+
+Lights and cameras *are* exported, but only into `--export-level` GLBs, where they are level actors;
+a per-mesh GLB has neither. Sky lights, IES profiles, light functions and area-light shape (beyond
+the `extras` block) remain out of scope.
 
 The one thing carried out of a material graph beyond the base-colour map is what glTF represents
 natively: a constant tint (`baseColorFactor`), the blend mode (`alphaMode`/`alphaCutoff`), and a

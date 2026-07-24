@@ -18,7 +18,9 @@ from uasset.mesh import StaticMesh, MaterialSpec, export_glb, _UE_TO_GLTF_SCALE
 import pickle
 import hashlib
 from uasset.texture import Texture2D, export_png
+from uasset.lights import camera_from_component, light_from_component
 from uasset.properties import read_properties
+from uasset.transform import rotator_to_matrix
 from uasset.scene import (
     _build_uasset_index,
     _get_material_names_from_mesh,
@@ -464,18 +466,101 @@ def export_level(input_dir, export_dir, umap_filename, context,
         placements.append((actor.name or actor.mesh_name,
                            actor.mesh_name, matrix))
 
+    light_specs = _level_lights(level, scale)
+    camera_specs = _level_cameras(level, placements, scale)
+
     out_path = os.path.join(export_dir, "Levels", f"{level_name}.glb")
     mesh_count, node_count = export_level_glb(meshes, placements, out_path,
-                                              scale=scale)
+                                              scale=scale,
+                                              lights=light_specs,
+                                              cameras=camera_specs)
     if not node_count:
         print("  Nothing to write")
         return None
 
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
     print(f"  Wrote {out_path}")
-    print(f"  {mesh_count} meshes, {node_count} placed instances, "
-          f"{size_mb:.1f} MB")
+    print(f"  {mesh_count} meshes, {node_count} nodes "
+          f"({len(placements)} placed instances, {len(light_specs)} lights, "
+          f"{len(camera_specs)} cameras), {size_mb:.1f} MB")
+    if light_specs:
+        kinds = Counter(spec.type for spec, _ in light_specs)
+        rects = sum(1 for spec, _ in light_specs
+                    if spec.extras and spec.extras.get('shape') == 'rect')
+        print(f"  Lights: {', '.join(f'{n} {k}' for k, n in kinds.most_common())}"
+              + (f"  ({rects} are rect lights encoded as spots; the rectangle "
+                 f"is described in each node's extras)" if rects else ""))
     return out_path
+
+
+def _emitter_matrix(emitter):
+    """The UE world transform of a light or camera component, without scale.
+
+    A punctual light and a camera have no extent, so a scale in their node
+    matrix means nothing — and eight of this level's lights inherit a 2.47×
+    from the Blueprint that places them.  UE ignores it too: a rect light's
+    ``SourceWidth``/``SourceHeight`` go into the render parameters unscaled.
+    Dropping it leaves a rigid transform, which is what a light node should be.
+    """
+    matrix = np.eye(4)
+    matrix[:3, :3] = rotator_to_matrix(*emitter.world_rotation)
+    matrix[:3, 3] = emitter.world_location
+    return matrix
+
+
+def _level_lights(level, scale):
+    """``(LightSpec, ue_world_matrix)`` for every light in the level."""
+    specs = []
+    for emitter in level.lights:
+        try:
+            spec = light_from_component(emitter.props, emitter.class_name,
+                                        emitter.name, scale)
+        except Exception as e:
+            print(f"  light {emitter.name}: ERROR {e}")
+            continue
+        if spec is not None:
+            specs.append((spec, _emitter_matrix(emitter)))
+    return specs
+
+
+def _level_cameras(level, placements, scale):
+    """``(CameraSpec, ue_world_matrix)`` for every camera in the level.
+
+    glTF has no way to say "no far plane", and a consumer handed a file without
+    one has to invent a number.  UE has no per-camera far plane to copy, so one
+    is derived from how big the level actually is — the bounding-box diagonal
+    of everything placed in it, rounded up — and written explicitly.
+    """
+    if not level.cameras:
+        return []
+
+    points = [matrix[:3, 3] for _n, _k, matrix in placements]
+    points += [np.asarray(e.world_location) for e in level.cameras]
+    if points:
+        stacked = np.asarray(points, dtype=float)
+        diagonal = float(np.linalg.norm(stacked.max(axis=0) - stacked.min(axis=0)))
+    else:
+        diagonal = 0.0
+    zfar = max(diagonal * scale, 1.0)
+
+    specs = []
+    orthographic = 0
+    for emitter in level.cameras:
+        try:
+            spec = camera_from_component(emitter.props, emitter.name, scale,
+                                         zfar)
+        except Exception as e:
+            print(f"  camera {emitter.name}: ERROR {e}")
+            continue
+        if spec.orthographic:
+            orthographic += 1
+        specs.append((spec, _emitter_matrix(emitter)))
+
+    if orthographic:
+        print(f"  NOTE: {orthographic} camera(s) are orthographic in UE and are "
+              f"written as perspective — glTF orthographic needs xmag/ymag, "
+              f"which UE's OrthoWidth alone does not give")
+    return specs
 
 
 def find_umap_path(input_dir, umap_filename):
@@ -569,7 +654,7 @@ def main():
     )
     parser.add_argument(
         '--export-level', metavar='LEVEL.umap',
-        help='Assemble the level into one positioned GLB in Export/Levels/'
+        help='Assemble the level into one positioned GLB in Export/Levels/, with its lights and cameras'
     )
     parser.add_argument(
         '--port', type=int, default=_PREVIEW_PORT,

@@ -3,6 +3,7 @@
 Parses FMeshDescription from FCompressedBuffer payload in the package trailer.
 Pipeline: .uasset → Package → Trailer → FCompressedBuffer → Oodle decompress → FMeshDescription → OBJ/GLB
 """
+import math
 import os
 import struct
 from typing import Dict, List, NamedTuple, Tuple, Optional
@@ -21,6 +22,8 @@ try:
         Mesh as GLTFMesh,
         Primitive,
         Material,
+        Camera,
+        Perspective,
         PbrMetallicRoughness,
         TextureInfo,
         Texture as GLTFTexture,
@@ -1068,10 +1071,80 @@ class _GLBBuilder:
         self.samplers: list = []
         self.materials: list = []
         self.meshes: list = []
+        self.cameras: list = []
+        # KHR_lights_punctual light definitions, referenced by node extension.
+        self.lights: list = []
         # Texture identity -> glTF texture index.  A level places dozens of
         # meshes that share one texture; embedding it per mesh would multiply
         # the file size by the reuse count.
         self._texture_index: Dict[object, int] = {}
+        # glTF texture index -> 'color' | 'data', so the same image is never
+        # asked to be both.  See _note_texture_slot.
+        self._texture_slot_kind: Dict[int, str] = {}
+
+    def _note_texture_slot(self, texture_index: int, kind: str) -> None:
+        """Record which colour space a texture is being used in, and enforce it.
+
+        An importer that dedupes by image and classifies colour space on first
+        use decodes the loser wrong: base colour and emissive are sRGB, while
+        normal, metallic-roughness and occlusion are linear.  Only base colour
+        is written today, so this cannot fire yet — it exists so that adding a
+        normal or MR map cannot quietly reuse a base-colour image.
+        """
+        previous = self._texture_slot_kind.setdefault(texture_index, kind)
+        if previous != kind:
+            raise AssertionError(
+                f"texture {texture_index} is used as both a {previous} and a "
+                f"{kind} map — one colour-space classification would win and "
+                f"the other would decode wrong; emit separate images")
+
+    # -- lights & cameras -------------------------------------------------
+
+    def add_light(self, spec) -> int:
+        """Add one ``KHR_lights_punctual`` light; returns its index.
+
+        Written straight through in the spec's units — candela for point and
+        spot, lux for directional, radians for cone angles.  Nothing here
+        rescales to suit a particular renderer.
+        """
+        light = {
+            'type': spec.type,
+            'color': [float(c) for c in spec.color],
+            'intensity': float(spec.intensity),
+        }
+        if spec.name:
+            light['name'] = spec.name
+        if spec.range:
+            light['range'] = float(spec.range)
+        if spec.type == 'spot':
+            light['spot'] = {
+                'innerConeAngle': float(spec.inner_cone_angle or 0.0),
+                'outerConeAngle': float(spec.outer_cone_angle
+                                        if spec.outer_cone_angle is not None
+                                        else math.pi / 4.0),
+            }
+        self.lights.append(light)
+        return len(self.lights) - 1
+
+    def add_camera(self, spec) -> int:
+        """Add one perspective camera; returns its index.
+
+        ``zfar`` is always written.  glTF treats an absent zfar as an infinite
+        projection, which is a thing a consumer then has to invent a number
+        for — better that the number is chosen here, where it is visible.
+        """
+        camera = Camera()
+        camera.type = 'perspective'
+        camera.perspective = Perspective(
+            aspectRatio=float(spec.aspect_ratio),
+            yfov=float(spec.yfov),
+            znear=float(spec.znear),
+            zfar=float(spec.zfar),
+        )
+        if spec.name:
+            camera.name = spec.name
+        self.cameras.append(camera)
+        return len(self.cameras) - 1
 
     # -- buffer plumbing --------------------------------------------------
 
@@ -1238,8 +1311,12 @@ class _GLBBuilder:
 
                 tex_info = TextureInfo()
                 tex_info.index = tex_index
+                # texCoord 0 always: only TEXCOORD_0 is written, and a consumer
+                # that reads attribute 0 regardless would silently sample the
+                # wrong set if this ever said otherwise.
                 tex_info.texCoord = 0
                 mat.pbrMetallicRoughness.baseColorTexture = tex_info
+                self._note_texture_slot(tex_index, 'color')
 
             _check_import_contract(mat, pil_img if mat_idx in texture_lookup
                                    else None)
@@ -1380,6 +1457,15 @@ class _GLBBuilder:
             gltf.samplers = self.samplers
         if self.images:
             gltf.images = self.images
+        if self.cameras:
+            gltf.cameras = self.cameras
+        if self.lights:
+            gltf.extensions = dict(gltf.extensions or {})
+            gltf.extensions['KHR_lights_punctual'] = {'lights': self.lights}
+            used = list(gltf.extensionsUsed or [])
+            if 'KHR_lights_punctual' not in used:
+                used.append('KHR_lights_punctual')
+            gltf.extensionsUsed = used
         gltf.accessors = self.accessors
         gltf.bufferViews = self.buffer_views
         gltf.buffers = [Buffer(byteLength=len(self.binary))]
@@ -1421,7 +1507,10 @@ def export_glb(mesh: StaticMesh, filepath: str,
 def export_level_glb(meshes: Dict[str, Tuple['StaticMesh', object]],
                      placements: List[Tuple[str, str, np.ndarray]],
                      filepath: str,
-                     scale: float = _UE_TO_GLTF_SCALE) -> Tuple[int, int]:
+                     scale: float = _UE_TO_GLTF_SCALE,
+                     lights: Optional[List[Tuple[object, np.ndarray]]] = None,
+                     cameras: Optional[List[Tuple[object, np.ndarray]]] = None
+                     ) -> Tuple[int, int]:
     """Export a whole level as one GLB with every actor already positioned.
 
     Each distinct mesh is stored once and referenced by a node per placement,
@@ -1437,9 +1526,12 @@ def export_level_glb(meshes: Dict[str, Tuple['StaticMesh', object]],
         scale:      UE-unit → glTF-unit factor; defaults to centimetres →
                     metres.  Applied identically to geometry and placements,
                     so the assembled level stays self-consistent.
+        lights:     ``(LightSpec, ue_world_matrix)`` per light.
+        cameras:    ``(CameraSpec, ue_world_matrix)`` per camera.
 
     Returns:
-        ``(meshes_written, nodes_written)``.
+        ``(meshes_written, nodes_written)``.  Light and camera nodes count
+        towards the node total.
     """
     if not _HAS_PYGLTFLIB:
         raise ImportError(
@@ -1462,6 +1554,26 @@ def export_level_glb(meshes: Dict[str, Tuple['StaticMesh', object]],
             continue
         node = GLTFNode(mesh=index)
         node.name = node_name
+        node.matrix = ue_matrix_to_gltf(world_matrix, scale)
+        nodes.append(node)
+
+    # A light or camera needs no basis correction beyond the one the meshes
+    # get: UE aims down +X with +Z up, and the axis remap sends +X to -Z and
+    # +Z to +Y, which is exactly how glTF orients a light or a camera.
+    for spec, world_matrix in (lights or ()):
+        node = GLTFNode()
+        node.name = spec.name
+        node.matrix = ue_matrix_to_gltf(world_matrix, scale)
+        node.extensions = {
+            'KHR_lights_punctual': {'light': builder.add_light(spec)}
+        }
+        if spec.extras:
+            node.extras = dict(spec.extras)
+        nodes.append(node)
+
+    for spec, world_matrix in (cameras or ()):
+        node = GLTFNode(camera=builder.add_camera(spec))
+        node.name = spec.name
         node.matrix = ue_matrix_to_gltf(world_matrix, scale)
         nodes.append(node)
 
