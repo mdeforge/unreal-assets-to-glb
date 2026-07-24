@@ -27,6 +27,10 @@ from uasset.scene import (
 )
 
 
+# Default port for both preview modes; --port overrides it.
+_PREVIEW_PORT = 3050
+
+
 # Shown by --help and by a bare invocation.  argparse substitutes %(prog)s, so
 # this reads correctly whether it was reached through main.py or the installed
 # console script — but no other '%' may appear here or that substitution fails.
@@ -49,6 +53,10 @@ examples:
   %(prog)s ./Input --skip-export --preview L_Showcase.umap
       Preview an already-exported project without re-exporting it.
 
+  %(prog)s --preview-glb ./Export/Levels/MainLevel.glb
+      Preview a converted .glb on its own — no project, no re-export.  This is
+      the file as written, so it is what to look at to check a conversion.
+
   %(prog)s ./Input --skip-textures
       Meshes only, no separate PNGs (textures are still embedded in the GLBs).
 
@@ -60,7 +68,7 @@ examples:
 
 INPUT_DIR must be an *uncooked* project folder: a .uproject at the top and a
 Content/ tree of .uasset / .umap files.  Cooked or packaged builds are not
-supported.
+supported.  --preview-glb needs no project at all.
 """
 
 
@@ -462,8 +470,30 @@ def find_umap_path(input_dir, umap_filename):
     return None
 
 
-def preview_level(input_dir, export_dir, umap_filename):
-    """Parse a .umap file and show a 3D preview in the browser."""
+def preview_glb(glb_path, port=_PREVIEW_PORT):
+    """Serve a browser preview of one already-converted GLB.
+
+    Nothing is parsed or converted here — the file is shown as it was written,
+    which is the point of looking at it.  Units come from the file itself, so
+    no project and no ``--scale`` are involved.
+    """
+    from uasset.preview_server import start_glb_server
+
+    print("=" * 60)
+    print("UE 5.5 GLB Previewer")
+    print("=" * 60)
+    print(f"Model: {glb_path}")
+
+    start_glb_server(glb_path=glb_path, port=port)
+
+
+def preview_level(input_dir, export_dir, umap_filename,
+                  scale=_UE_TO_GLTF_SCALE, port=_PREVIEW_PORT):
+    """Parse a .umap file and show a 3D preview in the browser.
+
+    ``scale`` must match the factor the GLBs in ``export_dir`` were exported
+    with — the viewer places actors in the units their geometry is baked in.
+    """
     from uasset.preview_server import start_server
 
     # Find the umap file
@@ -476,7 +506,8 @@ def preview_level(input_dir, export_dir, umap_filename):
         umap_path=umap_path,
         export_dir=export_dir,
         content_dir=input_dir,
-        port=3050,
+        port=port,
+        scale=scale,
     )
 
 
@@ -493,6 +524,11 @@ def main():
     parser.add_argument(
         '--preview', metavar='LEVEL.umap',
         help='Parse a .umap level and show 3D preview'
+    )
+    parser.add_argument(
+        '--preview-glb', metavar='FILE.glb',
+        help='Preview an already-converted .glb as it is — no project or '
+             'export needed. Use this to check a conversion.'
     )
     parser.add_argument(
         '--export-dir', default='./Export',
@@ -515,6 +551,11 @@ def main():
         help='Assemble the level into one positioned GLB in Export/Levels/'
     )
     parser.add_argument(
+        '--port', type=int, default=_PREVIEW_PORT,
+        help='Port for the preview server (default %(default)s). Use another '
+             'one to run a second preview alongside the first.'
+    )
+    parser.add_argument(
         '--scale', type=float, default=_UE_TO_GLTF_SCALE,
         help='UE-unit to glTF-unit scale (default %(default)s: UE centimetres '
              'to glTF metres). Pass 1.0 to keep UE centimetres.'
@@ -531,6 +572,23 @@ def main():
     if args.scale <= 0:
         print(f"ERROR: --scale must be positive, got {args.scale}")
         sys.exit(1)
+
+    # Previewing a converted GLB stands alone: it reads one finished file, so
+    # it runs before — and instead of — everything the project path needs.
+    if args.preview_glb:
+        if args.preview:
+            print("ERROR: --preview and --preview-glb are alternatives; "
+                  "pass one or the other")
+            sys.exit(1)
+        glb_path = os.path.abspath(args.preview_glb)
+        if not os.path.isfile(glb_path):
+            print(f"ERROR: GLB not found: {glb_path}")
+            sys.exit(1)
+        if not glb_path.lower().endswith('.glb'):
+            print(f"ERROR: --preview-glb expects a .glb file, got {glb_path}")
+            sys.exit(1)
+        preview_glb(glb_path, port=args.port)
+        return
 
     input_dir = os.path.abspath(args.input_dir)
     export_dir = os.path.abspath(args.export_dir)
@@ -572,7 +630,8 @@ def main():
     # Preview if requested
     if args.preview:
         print(f"\n{'=' * 60}")
-        preview_level(input_dir, export_dir, args.preview)
+        preview_level(input_dir, export_dir, args.preview, scale=args.scale,
+                      port=args.port)
 
 
 if __name__ == "__main__":

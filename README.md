@@ -45,6 +45,10 @@ python main.py ./Input --preview L_Showcase.umap
 # Preview without re-exporting
 python main.py ./Input --skip-export --preview L_Showcase.umap
 
+# Preview a converted .glb on its own, exactly as it was written — no project
+# needed. Add --port to run it next to another preview.
+python main.py --preview-glb ./Export/Levels/L_Showcase.glb
+
 # Export without textures
 python main.py ./Input --skip-textures
 
