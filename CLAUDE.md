@@ -111,7 +111,7 @@ Everything lives in the `uasset/` package. Parsing pipeline, roughly:
 | `properties.py` | Property-tag parsing/skipping; handles both the UE4-style and the newer `PROPERTY_TAG_COMPLETE_TYPE_NAME` format. `skip_properties` for mesh/texture, `read_properties` for umap, `read_property_tag`/`end_property_tag`/`has_serialization_control_byte` for callers that walk tags themselves |
 | `mesh.py` | `StaticMesh.from_package`, FMeshDescription parsing, `_GLBBuilder` and the `export_glb` / `export_level_glb` writers |
 | `texture.py` | `Texture2D.from_package` (FEditorBulkData source art, Oodle + optional `TSCF_UEDELTA` delta decode), `export_png` |
-| `scene.py` | Asset index (keyed by parsed export object name) and mesh → material → base-color texture resolution: parent-chain walk, `TextureParameterValues` overrides, cross-package BaseColor expression graph, material layers |
+| `scene.py` | Asset index (keyed by parsed export object name) and mesh → material resolution: base-colour and emissive, parent-chain walk, `TextureParameterValues` overrides, cross-package BaseColor/EmissiveColor expression graphs, material layers, blend mode |
 | `umap.py` | `.umap` level parsing: actors, transforms, static-mesh references, level instancing, World Partition external actors, and light/camera components (`LevelEmitter`) |
 | `lights.py` | UE light and camera components → `KHR_lights_punctual` and glTF cameras: per-light `ELightUnits` conversion to candela/lux, UE defaults, sRGB + blackbody colour, rect-light encoding |
 | `transform.py` | UE `FRotator`/transform math → matrices for the renderer |
@@ -208,8 +208,8 @@ suffix — rule 1 below forbids the latter.
 ### Material appearance → glTF
 
 `scene.resolve_material_appearance` returns a `MaterialAppearance`: the base-colour map, the
-constant `factor` that multiplies it, and the blend mode. glTF splits what UE keeps in one graph,
-and two of the three map exactly:
+constant `factor` that multiplies it, the blend mode, and the `Emissive` (see "Emissive → glTF"
+below). glTF splits what UE keeps in one graph, and two of the three base-colour parts map exactly:
 
 - **Tint.** UE's `BaseColor = Tint * Texture` *is* glTF's `baseColorFactor * baseColorTexture`, so a
   constant colour feeding BaseColor survives rather than being dropped. Instance
@@ -229,6 +229,39 @@ alpha of 191 with no mask data, and between them they clothe 65 meshes. As `MASK
 cutoff they stay solid, which is correct; as `BLEND` they would turn most of the level 75%
 see-through. Only `T_Bush_D` (alpha 0–255) is a genuine cutout in the sample project.
 
+### Emissive → glTF
+
+`scene._resolve_emissive` reduces a material's `EmissiveColor` graph, which is a product
+(`tint × texture × intensity`), by walking it: a `Multiply` is the product of its inputs, a
+`LinearInterpolate` is taken as its first input (the same "first endpoint" rule base colour uses for
+a lerp — the other side is usually an animated or blended-away state), a vector parameter is a tint,
+a scalar an intensity, and the first texture sampler the emissive map. Nodes that are not a product
+(a `Sine` driving a glitch, a `Panner`) are not descended into, so the LCD panels' animated overlay
+does not bleed into the static emission. This mirrors the base-colour discipline; evaluating the
+graph per pixel stays out of scope.
+
+The result splits into glTF's fields the way the importer folds them back (`factor × strength`):
+
+- **`emissiveFactor` is the normalized tint, ≤1**, and the magnitude goes to
+  `KHR_materials_emissive_strength`. glTF core clamps the factor to [0,1], so an over-1 factor is
+  silently capped and brights are lost — the split is the only way `MI_ReparingTools_01`'s ×19.5 or
+  `MI_IM4`'s red ×8 survive. `_EMISSIVE_STRENGTH_CEILING` (64, from the engine material) is flagged,
+  not clamped.
+- **A colour-map emissive texture passes through** — it is already sRGB in the source, and the
+  importer loads emissive sRGB. A **single-channel** emissive (a packed mask read as a *shape*, like
+  `M_Lamp`'s `T_Lamp_M.B`) has no glTF equivalent — the importer has no scalar emissive input — so
+  `_emissive_rgb` bakes that channel to a grey RGB image, sRGB-encoding it so it survives the
+  importer's decode. Fold-to-constant would be wrong here because the channel varies spatially (only
+  the lens glows); the pixels decide (`min == max` ⇒ uniform).
+- **A wired-but-black emissive emits nothing.** An instance that does not override the master's
+  `T_Black` default, or whose emissive texture is an all-zero image (`T_1_Ship_2_E` is blank — the
+  ship does *not* glow, despite the `_E` file existing), multiplies to zero. `Emissive.texture_required`
+  says the chain sampled a texture at all, and the drop happens where the fact is knowable: `cli.py`
+  drops a slot whose texture is absent from the project (a cache miss — the `T_Black` default), and
+  the writer's `_emissive_rgb` drops one whose texture *is* present but all-black, returning None.
+  Both are data-driven, not a name check (rule 1): `max == 0` distinguishes the blank placeholder
+  from a real sparse emissive like `T_ReparingTools_E`.
+
 ### The importer contract — four silent failures
 
 The GLBs feed an engine (`AxConvert` → Axon) whose importer fails *quietly* in four places. The
@@ -244,17 +277,19 @@ file still imports wrong. All four are asserted at write time — `mesh._check_i
    constant opacity into the alpha channel, then resets `factor[3]` to 1.0 so it is not applied
    twice. Where it has no texture, `factor[3]` carries the alpha.
 2. **`emissiveFactor` must be non-zero wherever `emissiveTexture` is set.** The shader computes
-   `emissive = factor.rgb; if (tex) emissive *= tex`, and glTF defaults the factor to `[0,0,0]` —
-   which multiplies any emissive texture to nothing. Nothing emits `emissiveTexture` today; the
-   assert exists so adding it cannot regress.
+   `emissive = emissiveFactor.rgb * texture(...)`, and glTF defaults the factor to `[0,0,0]` — which
+   multiplies any emissive texture to nothing. `_apply_emissive` forces the factor non-zero (a
+   normalized tint already has a component at 1; a degenerate all-zero factor falls back to white),
+   and `_check_import_contract` asserts it. This one fires for real now — emissive textures *are*
+   written.
 3. **`alphaMode` is always written.** Absent means `OPAQUE` and their shader then hard-forces alpha
    to 1, discarding transparency carried only in texture alpha. pygltflib serializes the field
    unconditionally, so this holds today; it is listed because it is not free if the writer changes.
 4. **No image is used as both a colour and a data map.** They dedupe by image and the first
    colour-space classification wins, so an image used as both base-colour/emissive (sRGB) and
-   normal/MR/AO (linear) decodes wrong in one of the two. Only base colour is written today, so
-   `_note_texture_slot` cannot fire yet — it exists so adding a normal or MR map cannot silently
-   reuse a base-colour image.
+   normal/MR/AO (linear) decodes wrong in one of the two. Base colour **and emissive** are both
+   written now, both `'color'`, so `_note_texture_slot` passes them; it exists so that adding a
+   normal or MR map (`'data'`) cannot silently reuse one of those images.
 
 Also binding, and already true: **one UV set** (everything on `TEXCOORD_0`; they read attribute 0
 and ignore `texCoord`), no `KHR_texture_transform` (bake into UVs), PNG only — no KTX2 — and
@@ -449,18 +484,20 @@ From `.roo/rules/rule n1.txt` (originally in Russian) — these are binding:
 ## Scope — deliberately not supported
 
 Do not "fix" these as if they were bugs; they are out of scope by design:
-graph-based/complex material shaders, colliders, PBR texture channels (base color only),
-vertex colors, tangents, LODs, shaders, texture baking, Nanite, animation decompression,
-skeletons/bones. Only **one UV channel** is exported.
+graph-based/complex material shaders, colliders, the metallic/roughness/normal/AO PBR channels
+(base colour and emissive are the two carried), vertex colors, tangents, LODs, shaders, texture
+baking, Nanite, animation decompression, skeletons/bones. Only **one UV channel** is exported.
 
 Lights and cameras *are* exported, but only into `--export-level` GLBs, where they are level actors;
 a per-mesh GLB has neither. Sky lights, IES profiles, light functions and area-light shape (beyond
 the `extras` block) remain out of scope.
 
-The one thing carried out of a material graph beyond the base-colour map is what glTF represents
-natively: a constant tint (`baseColorFactor`), the blend mode (`alphaMode`/`alphaCutoff`), and a
-constant opacity. Evaluating the graph — per-pixel fresnel, lerps, channel arithmetic — remains out
-of scope; where opacity is not a constant the exporter says so instead of approximating it.
+What is carried out of a material graph is what glTF represents natively: the base-colour map with a
+constant tint (`baseColorFactor`), the blend mode (`alphaMode`/`alphaCutoff`), a constant opacity,
+and the **emissive** as `emissiveFactor` + `emissiveTexture` + `KHR_materials_emissive_strength`.
+Evaluating the graph — per-pixel fresnel, lerps, channel arithmetic — remains out of scope; the
+emissive walk reduces a *product* of tint/texture/intensity and stops at anything else, and where
+opacity is not a constant the exporter says so instead of approximating it.
 
 Also note: each branch targets exactly one UE version (`5.5` here, `4.27.2` elsewhere). Format
 handling for a different UE version belongs on that version's branch, not behind runtime switches.

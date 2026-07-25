@@ -990,8 +990,14 @@ class MaterialSpec(NamedTuple):
     """One material slot's appearance, as the GLB writer wants it.
 
     A plain ``(material_index, pixels, key)`` tuple still works wherever this
-    is accepted — the extra fields default to an opaque, untinted material —
-    so callers that only have a texture need not build one of these.
+    is accepted — the extra fields default to an opaque, untinted, non-emissive
+    material — so callers that only have a texture need not build one of these.
+
+    Emission is carried already decomposed: ``emissive_factor`` is the
+    normalized tint (≤1), ``emissive_strength`` the magnitude (>0 turns it on),
+    ``emissive_pixels`` the emissive colour map or None, and
+    ``emissive_channel`` the single channel to bake out when the map is a packed
+    mask rather than a colour image.
     """
     material_index: int
     pixels: object = None
@@ -999,6 +1005,11 @@ class MaterialSpec(NamedTuple):
     factor: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
     alpha_mode: str = 'OPAQUE'
     alpha_cutoff: Optional[float] = None
+    emissive_factor: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    emissive_strength: float = 0.0
+    emissive_pixels: object = None
+    emissive_key: Optional[str] = None
+    emissive_channel: Optional[str] = None
 
 
 def _as_rgba(pixels) -> np.ndarray:
@@ -1012,6 +1023,48 @@ def _as_rgba(pixels) -> np.ndarray:
         alpha = np.full(array.shape[:2] + (1,), 255, dtype=array.dtype)
         return np.concatenate([array, alpha], axis=2)
     raise ValueError(f"unsupported base-colour channel count {array.shape[2]}")
+
+
+_CHANNEL_INDEX = {'R': 0, 'G': 1, 'B': 2, 'A': 3}
+
+
+def _srgb_encode(linear: np.ndarray) -> np.ndarray:
+    """Encode a linear [0,1] array to sRGB, the inverse of the importer's decode.
+
+    Callers pass a mask already in [0,1], so no clamp is needed before the power.
+    """
+    return np.where(linear <= 0.0031308,
+                    linear * 12.92,
+                    1.055 * np.power(linear, 1 / 2.4) - 0.055)
+
+
+def _emissive_rgb(pixels, channel: Optional[str]) -> Optional[np.ndarray]:
+    """The emissive colour map as an RGB uint8 image, or None if it is black.
+
+    A full-colour emissive texture is already sRGB-encoded in the source, so it
+    passes straight through — the importer loads it sRGB and the shader
+    multiplies it by the factor, exactly as authored.  A single-channel mask is
+    a *shape*, not a colour: the importer has no scalar emissive input, so the
+    channel is extracted to a grey RGB image.  Its values are a linear
+    multiplier, so they are sRGB-encoded here to survive the importer's sRGB
+    decode unchanged.
+    """
+    array = np.asarray(pixels)
+    if channel is not None:
+        idx = _CHANNEL_INDEX.get(channel, 0)
+        if array.ndim < 3 or idx >= array.shape[2]:
+            return None
+        mask = array[..., idx].astype(np.float32) / 255.0
+        if float(mask.max()) <= 0.0:
+            return None
+        encoded = (_srgb_encode(mask) * 255.0 + 0.5).astype(np.uint8)
+        return np.stack([encoded] * 3, axis=-1)
+    if array.ndim == 2:
+        array = np.stack([array] * 3, axis=-1)
+    rgb = array[..., :3]
+    if int(rgb.max()) == 0:
+        return None
+    return np.ascontiguousarray(rgb)
 
 
 def _check_import_contract(mat, base_color_image) -> None:
@@ -1081,6 +1134,9 @@ class _GLBBuilder:
         # glTF texture index -> 'color' | 'data', so the same image is never
         # asked to be both.  See _note_texture_slot.
         self._texture_slot_kind: Dict[int, str] = {}
+        # Set once any material writes KHR_materials_emissive_strength, so the
+        # extension is declared in extensionsUsed at save time.
+        self._emissive_strength_used = False
 
     def _note_texture_slot(self, texture_index: int, kind: str) -> None:
         """Record which colour space a texture is being used in, and enforce it.
@@ -1193,6 +1249,90 @@ class _GLBBuilder:
             self.samplers.append(sampler)
         return 0
 
+    def _embed_texture(self, pil_img, identity) -> int:
+        """Embed a PIL image as a PNG texture, reusing it if already embedded.
+
+        Keyed on *identity* — the texture's package path — so a level that
+        shares one texture across dozens of meshes stores its pixels once.
+        """
+        from io import BytesIO
+        if identity is not None and identity in self._texture_index:
+            return self._texture_index[identity]
+
+        buf = BytesIO()
+        pil_img.save(buf, format='PNG')
+        bv_idx = self._add_buffer_view(buf.getvalue())
+
+        img = GLTFImage()
+        img.bufferView = bv_idx
+        img.mimeType = 'image/png'
+        self.images.append(img)
+
+        tex = GLTFTexture()
+        tex.source = len(self.images) - 1
+        tex.sampler = self._sampler()
+        self.textures.append(tex)
+
+        tex_index = len(self.textures) - 1
+        if identity is not None:
+            self._texture_index[identity] = tex_index
+        return tex_index
+
+    def _apply_emissive(self, mat, spec: 'MaterialSpec') -> None:
+        """Write a material's emission as emissiveFactor (+ strength, + texture).
+
+        The factor is already normalized to ≤1 and the >1 magnitude lives in
+        ``KHR_materials_emissive_strength``, because glTF clamps the factor to
+        [0,1] and an over-1 factor would be silently capped.  Where the emission
+        has a colour map it is embedded as an sRGB image kept out of the
+        data-map dedup bucket (``_note_texture_slot``); a packed-mask channel is
+        baked to RGB first (``_emissive_rgb``).
+        """
+        from PIL import Image as PILImage
+        if spec.emissive_strength <= 0.0:
+            return
+
+        tex_index = None
+        if spec.emissive_pixels is not None:
+            # Bake once per distinct (texture, channel): a level shares one
+            # emissive map across many meshes, and the sRGB bake of a 2048²
+            # mask is far more expensive than the embed dedup that already
+            # follows it — so the cache is checked *before* baking.  A cached
+            # texture was embedded once, so it is known non-black.
+            key = ('emissive', spec.emissive_key, spec.emissive_channel)
+            tex_index = (self._texture_index.get(key)
+                         if spec.emissive_key else None)
+            if tex_index is None:
+                rgb = _emissive_rgb(spec.emissive_pixels, spec.emissive_channel)
+                if rgb is None:
+                    return          # the map is all black — nothing emits
+                image = PILImage.fromarray(rgb, 'RGB')
+                tex_index = self._embed_texture(
+                    image, key if spec.emissive_key else None)
+
+        # Rule 2: an emissiveFactor of zero would multiply any texture to
+        # nothing, so it is forced non-zero.  A normalized tint already has a
+        # component at 1; a degenerate all-zero factor falls back to white.
+        factor = list(spec.emissive_factor)
+        if tex_index is not None and not any(factor):
+            factor = [1.0, 1.0, 1.0]
+        mat.emissiveFactor = factor
+
+        strength = spec.emissive_strength
+        if strength != 1.0:
+            mat.extensions = dict(mat.extensions or {})
+            mat.extensions['KHR_materials_emissive_strength'] = {
+                'emissiveStrength': float(strength)
+            }
+            self._emissive_strength_used = True
+
+        if tex_index is not None:
+            tex_info = TextureInfo()
+            tex_info.index = tex_index
+            tex_info.texCoord = 0
+            mat.emissiveTexture = tex_info
+            self._note_texture_slot(tex_index, 'color')
+
     def add_mesh(self, mesh: 'StaticMesh',
                  textures: Optional[List[Tuple[int, object]]] = None,
                  name: Optional[str] = None) -> Optional[int]:
@@ -1284,31 +1424,10 @@ class _GLBBuilder:
                 # cutout leaf is meaningless backface-culled.
                 mat.doubleSided = True
 
+            base_color_image = None
             if mat_idx in texture_lookup:
-                pil_img, identity = texture_lookup[mat_idx]
-                tex_index = self._texture_index.get(identity) if identity else None
-
-                if tex_index is None:
-                    buf = BytesIO()
-                    pil_img.save(buf, format='PNG')
-                    png_bytes = buf.getvalue()
-
-                    bv_idx = self._add_buffer_view(png_bytes)
-
-                    img = GLTFImage()
-                    img.bufferView = bv_idx
-                    img.mimeType = 'image/png'
-                    self.images.append(img)
-
-                    tex = GLTFTexture()
-                    tex.source = len(self.images) - 1
-                    tex.sampler = self._sampler()
-                    self.textures.append(tex)
-
-                    tex_index = len(self.textures) - 1
-                    if identity is not None:
-                        self._texture_index[identity] = tex_index
-
+                base_color_image, identity = texture_lookup[mat_idx]
+                tex_index = self._embed_texture(base_color_image, identity)
                 tex_info = TextureInfo()
                 tex_info.index = tex_index
                 # texCoord 0 always: only TEXCOORD_0 is written, and a consumer
@@ -1318,8 +1437,9 @@ class _GLBBuilder:
                 mat.pbrMetallicRoughness.baseColorTexture = tex_info
                 self._note_texture_slot(tex_index, 'color')
 
-            _check_import_contract(mat, pil_img if mat_idx in texture_lookup
-                                   else None)
+            self._apply_emissive(mat, spec)
+
+            _check_import_contract(mat, base_color_image)
             self.materials.append(mat)
             mat_idx_to_gltf_mat[mat_idx] = len(self.materials) - 1
 
@@ -1459,12 +1579,16 @@ class _GLBBuilder:
             gltf.images = self.images
         if self.cameras:
             gltf.cameras = self.cameras
+        used = list(gltf.extensionsUsed or [])
         if self.lights:
             gltf.extensions = dict(gltf.extensions or {})
             gltf.extensions['KHR_lights_punctual'] = {'lights': self.lights}
-            used = list(gltf.extensionsUsed or [])
             if 'KHR_lights_punctual' not in used:
                 used.append('KHR_lights_punctual')
+        if self._emissive_strength_used \
+                and 'KHR_materials_emissive_strength' not in used:
+            used.append('KHR_materials_emissive_strength')
+        if used:
             gltf.extensionsUsed = used
         gltf.accessors = self.accessors
         gltf.bufferViews = self.buffer_views

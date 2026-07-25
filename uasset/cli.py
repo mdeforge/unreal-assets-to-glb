@@ -179,12 +179,35 @@ def resolve_mesh_textures(mesh, name, uasset_index, tex_name_map, texture_cache,
                 warn(f"  {name}: material '{mat_name}' {note}")
         pixels = (texture_cache.get(appearance.texture)
                   if appearance.texture else None)
-        if pixels is None and appearance.alpha_mode == 'OPAQUE' \
-                and appearance.factor == (1.0, 1.0, 1.0, 1.0):
+
+        # Emission.  A slot wired to an emissive texture that resolves to
+        # nothing-in-project (the unoverridden black default) or to an all-black
+        # image emits zero — that check needs the pixels, which live here.
+        em = appearance.emissive
+        emissive_factor = (0.0, 0.0, 0.0)
+        emissive_strength = 0.0
+        emissive_pixels = emissive_key = emissive_channel = None
+        if em.strength > 0.0:
+            em_pixels = (texture_cache.get(em.texture) if em.texture else None)
+            # A slot wired to a texture that is absent from the project (the
+            # unoverridden black default) emits nothing; the all-black case of a
+            # texture that *is* present is caught later, in the writer's bake.
+            if not (em.texture_required and em_pixels is None):
+                emissive_factor = em.factor
+                emissive_strength = em.strength
+                emissive_pixels = em_pixels
+                emissive_key = em.texture
+                emissive_channel = em.channel
+
+        has_base = pixels is not None or appearance.alpha_mode != 'OPAQUE' \
+            or appearance.factor != (1.0, 1.0, 1.0, 1.0)
+        if not has_base and emissive_strength <= 0.0:
             return None          # nothing to say about this slot
         return MaterialSpec(index, pixels, appearance.texture,
                             appearance.factor, appearance.alpha_mode,
-                            appearance.alpha_cutoff)
+                            appearance.alpha_cutoff,
+                            emissive_factor, emissive_strength,
+                            emissive_pixels, emissive_key, emissive_channel)
 
     if mesh.material_slots and mesh.material_slot_names:
         section_map = getattr(mesh, 'section_info_map', None)

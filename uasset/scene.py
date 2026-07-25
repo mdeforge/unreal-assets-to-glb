@@ -701,20 +701,48 @@ _ALPHA_MODE_BY_BLEND = {
 _DEFAULT_MASK_CLIP = 0.3333
 
 
+class Emissive(NamedTuple):
+    """A material's emission, decomposed the way glTF wants it.
+
+    UE builds emission as ``tint × texture × intensity`` in one graph; glTF
+    splits it into ``emissiveFactor × emissiveTexture`` with the >1 magnitude in
+    ``KHR_materials_emissive_strength``.  The factor is the normalized tint
+    (≤1, as the spec requires); the strength carries the rest.
+
+    ``texture`` is the emissive colour map, or None for a constant emission.
+    ``channel`` names the single channel to read when the graph samples one —
+    a packed mask used as an emissive *shape* — which the writer bakes into an
+    RGB image, since the importer has no single-channel emissive input.
+
+    ``texture_required`` records that the product chain contained a texture at
+    all: a slot wired to a texture that resolves to nothing-in-project or an
+    all-black image emits *zero*, and the caller (which has the pixels) drops
+    it — the default ``T_Black`` emissive on an unoverridden instance is exactly
+    this, and honouring the tint alone would light a surface UE leaves dark.
+    """
+    factor: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    strength: float = 0.0
+    texture: Optional[str] = None
+    channel: Optional[str] = None
+    texture_required: bool = False
+
+
 class MaterialAppearance(NamedTuple):
     """What the GLB writer needs to reproduce a material's base colour.
 
     ``texture`` is the base-colour map (a *tex_map* value) or None; ``factor``
     is glTF ``baseColorFactor``, which multiplies it exactly as UE's tint
     multiply does.  ``alpha_mode``/``alpha_cutoff`` carry the blend mode.
-    ``notes`` is what the export loop should print — a non-opaque material
-    whose opacity could not be pinned down is the case that otherwise fails
-    silently downstream.
+    ``emissive`` carries the emission, split into the glTF fields.  ``notes`` is
+    what the export loop should print — a non-opaque material whose opacity
+    could not be pinned down is the case that otherwise fails silently
+    downstream.
     """
     texture: Optional[str] = None
     factor: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
     alpha_mode: str = 'OPAQUE'
     alpha_cutoff: Optional[float] = None
+    emissive: Emissive = Emissive()
     notes: Tuple[str, ...] = ()
 
 
@@ -806,6 +834,49 @@ def _material_alpha(material_name: str, graph: '_MaterialGraph'
     return mode, clip if clip is not None else _DEFAULT_MASK_CLIP
 
 
+# The expression classes that are a constant colour or a constant scalar.  A
+# parameter is a constant with a name an instance can override; a Constant node
+# is a literal.  Kept in one place because both the base-colour and the emissive
+# walk have to recognise them.
+_VECTOR_CONSTANT_CLASSES = frozenset({
+    'MaterialExpressionVectorParameter',
+    'MaterialExpressionConstant3Vector',
+    'MaterialExpressionConstant4Vector',
+})
+_SCALAR_CONSTANT_CLASSES = frozenset({
+    'MaterialExpressionScalarParameter',
+    'MaterialExpressionConstant',
+})
+
+
+def _read_constant_node(pkg: Package, class_name: str,
+                        props: List[TaggedProperty]):
+    """A constant expression's value and the parameter name that can override it.
+
+    Returns ``('vector', rgba, name)`` or ``('scalar', value, name)`` for the
+    constant colour and scalar classes, or ``None`` for anything else — the one
+    place that knows where a constant node keeps its value.
+    """
+    if class_name in _VECTOR_CONSTANT_CLASSES:
+        entry = (_find_prop(props, 'DefaultValue', 'StructProperty')
+                 or _find_prop(props, 'Constant', 'StructProperty'))
+        value = _read_linear_color(entry[1]) if entry else None
+        return 'vector', value, _node_parameter_name(pkg, props)
+    if class_name in _SCALAR_CONSTANT_CLASSES:
+        entry = (_find_prop(props, 'DefaultValue', 'FloatProperty')
+                 or _find_prop(props, 'R', 'FloatProperty'))
+        value = _read_float(entry[1]) if entry else None
+        return 'scalar', value, _node_parameter_name(pkg, props)
+    return None
+
+
+def _node_parameter_name(pkg: Package,
+                         props: List[TaggedProperty]) -> Optional[str]:
+    """The ``ParameterName`` of an expression node, if it is a parameter."""
+    entry = _find_prop(props, 'ParameterName', 'NameProperty')
+    return _read_fname_value(pkg, entry[1]) if entry else None
+
+
 def _constant_from(pkg: Package, root: Optional[int], graph: '_MaterialGraph'):
     """The first constant colour or scalar an input reaches.
 
@@ -829,23 +900,13 @@ def _constant_from(pkg: Package, root: Optional[int], graph: '_MaterialGraph'):
 
         class_name = pkg.get_export_class_name(exp_idx)
         props = _read_export_properties(pkg, exp_idx)
-        param = _find_prop(props, 'ParameterName', 'NameProperty')
-        param_name = _read_fname_value(pkg, param[1]) if param else None
 
-        if class_name in ('MaterialExpressionVectorParameter',
-                          'MaterialExpressionConstant3Vector',
-                          'MaterialExpressionConstant4Vector'):
-            entry = (_find_prop(props, 'DefaultValue', 'StructProperty')
-                     or _find_prop(props, 'Constant', 'StructProperty'))
-            rgba = _read_linear_color(entry[1]) if entry else None
-            if color is None:
-                color = (rgba, param_name)
-        elif class_name in ('MaterialExpressionScalarParameter',
-                            'MaterialExpressionConstant'):
-            entry = (_find_prop(props, 'DefaultValue', 'FloatProperty')
-                     or _find_prop(props, 'R', 'FloatProperty'))
-            value = _read_float(entry[1]) if entry else None
-            if scalar is None:
+        node = _read_constant_node(pkg, class_name, props)
+        if node is not None:
+            kind, value, param_name = node
+            if kind == 'vector' and color is None:
+                color = (value, param_name)
+            elif kind == 'scalar' and scalar is None:
                 scalar = (value, param_name)
 
         for child, _masked in _expression_inputs(pkg, props):
@@ -854,17 +915,23 @@ def _constant_from(pkg: Package, root: Optional[int], graph: '_MaterialGraph'):
     return color, scalar
 
 
-def _material_input_root(pkg: Package, input_name: str):
-    """The expression a named material output reads, with its channel mask."""
+def _material_input_root(pkg: Package, input_name: str
+                         ) -> Tuple[Optional[int], Optional[str]]:
+    """The expression a named material output reads, and its single channel.
+
+    The channel is a letter when the input's mask narrows to exactly one, else
+    None; a base-colour caller treats "any channel" as "not a colour" simply by
+    testing whether the channel is set.
+    """
     for i in range(pkg.export_count):
         if pkg.get_export_class_name(i) != 'MaterialEditorOnlyData':
             continue
         entry = _find_prop(_read_export_properties(pkg, i), input_name,
                            'StructProperty')
         if entry is None:
-            return None, False
-        return read_expression_input(entry[1])
-    return None, False
+            return None, None
+        return _read_int32(entry[1]), _expression_channel(entry[1])
+    return None, None
 
 
 def resolve_material_appearance(material_name: str,
@@ -892,10 +959,12 @@ def resolve_material_appearance(material_name: str,
     # Constant colour / opacity live on the master's graph; the instances above
     # it supply the parameter values that replace their defaults.
     color = scalar = None
+    master_pkg: Optional[Package] = None
     name: Optional[str] = material_name
     visited = set()
     vector_overrides: Dict[str, Tuple[float, float, float, float]] = {}
     scalar_overrides: Dict[str, float] = {}
+    texture_overrides: Dict[str, str] = {}
 
     while name is not None and name not in visited and len(visited) <= 8:
         visited.add(name)
@@ -909,15 +978,20 @@ def resolve_material_appearance(material_name: str,
                 vector_overrides.setdefault(key[0], rgba)
         for param, value in _parse_scalar_parameter_values(pkg).items():
             scalar_overrides.setdefault(param, value)
+        for (param, _assoc, _index), tex in \
+                _parse_texture_parameter_values(pkg).items():
+            texture_overrides.setdefault(param, tex)
 
         if color is None:
-            root, masked = _material_input_root(pkg, 'BaseColor')
-            if root and not masked:
+            root, channel = _material_input_root(pkg, 'BaseColor')
+            if root and not channel:
                 color, _ = _constant_from(pkg, root, graph)
         if scalar is None and alpha_mode == 'BLEND':
-            root, _masked = _material_input_root(pkg, 'Opacity')
+            root, _channel = _material_input_root(pkg, 'Opacity')
             if root:
                 _, scalar = _constant_from(pkg, root, graph)
+        if master_pkg is None and _material_input_root(pkg, 'EmissiveColor')[0]:
+            master_pkg = pkg
         name = _find_parent_material_name(pkg, name)
 
     notes: List[str] = []
@@ -943,10 +1017,130 @@ def resolve_material_appearance(material_name: str,
         else:
             notes.append('translucent but opacity is not a constant, using 1.0')
 
+    emissive = _resolve_emissive(master_pkg, tex_map, vector_overrides,
+                                 scalar_overrides, texture_overrides)
+    if emissive.strength > _EMISSIVE_STRENGTH_CEILING:
+        notes.append(f'emissive strength {emissive.strength:.1f} exceeds the '
+                     f'engine headroom of {_EMISSIVE_STRENGTH_CEILING:.0f}')
+
     logger.debug(f"Material '{material_name}': texture={texture} rgb={rgb} "
-                 f"alpha={alpha} mode={alpha_mode} cutoff={alpha_cutoff}")
+                 f"alpha={alpha} mode={alpha_mode} cutoff={alpha_cutoff} "
+                 f"emissive={emissive}")
     return MaterialAppearance(texture, rgb + (alpha,), alpha_mode,
-                              alpha_cutoff, tuple(notes))
+                              alpha_cutoff, emissive, tuple(notes))
+
+
+# Emissive brights fold to a single HDR factor of factor*strength on import; the
+# engine's material caps that at 64 (AxStandardPBR.h).  Past it is flagged, not
+# clamped — the file stays spec-correct and the ceiling is the engine's to
+# enforce.
+_EMISSIVE_STRENGTH_CEILING = 64.0
+
+# Node classes the emissive product-walk evaluates.  A Multiply is the product
+# of its inputs; a LinearInterpolate is treated as its first input, the same
+# "take the first endpoint" rule the base-colour walk uses for a lerp — the
+# other endpoint is usually an animated or blended-away state glTF cannot carry.
+_EMISSIVE_MULTIPLY = 'MaterialExpressionMultiply'
+_EMISSIVE_LERP = 'MaterialExpressionLinearInterpolate'
+
+
+def _resolve_emissive(pkg: Optional[Package], tex_map: Dict[str, str],
+                      vector_overrides: Dict[str, Tuple[float, float, float, float]],
+                      scalar_overrides: Dict[str, float],
+                      texture_overrides: Dict[str, str]) -> Emissive:
+    """Reduce a material's EmissiveColor graph to the glTF emissive fields.
+
+    UE emission is a product — ``tint × texture × intensity`` — so the graph is
+    walked as one: a Multiply contributes the product of its inputs, a colour
+    parameter a tint, a scalar parameter an intensity, and the first texture
+    sampler the emissive map (noting the single channel where it samples one).
+    Nodes that are not a product (a Sine driving a glitch, a Panner) are not
+    descended into, which is what keeps the animated overlay on the LCD panels
+    from bleeding into the static emission.
+
+    The tint goes to ``factor`` normalized to ≤1 and the magnitude to
+    ``strength``, because glTF clamps ``emissiveFactor`` to [0,1] and an
+    over-1 factor would be silently capped.  Whether the chain sampled a
+    texture at all is returned in ``texture_required`` so the caller, which has
+    the pixels, can drop a slot whose texture is the unoverridden black default.
+    """
+    if pkg is None:
+        return Emissive()
+    root, root_channel = _material_input_root(pkg, 'EmissiveColor')
+    if not root:
+        return Emissive()
+
+    color = [1.0, 1.0, 1.0]
+    scale = 1.0
+    texture: Optional[str] = None
+    channel: Optional[str] = None
+    had_texture = False
+    visited = set()
+
+    def visit(index: Optional[int], edge_channel: Optional[str]) -> None:
+        nonlocal scale, texture, channel, had_texture
+        if not index or index <= 0 or index in visited:
+            return
+        visited.add(index)
+        exp_idx = index - 1
+        if not 0 <= exp_idx < len(pkg.exports):
+            return
+        class_name = pkg.get_export_class_name(exp_idx)
+        props = _read_export_properties(pkg, exp_idx)
+
+        if class_name.startswith('MaterialExpressionTextureSample'):
+            had_texture = True
+            if texture is None:
+                sampler = _read_sampler(pkg, props)
+                if sampler is not None:
+                    name, default = sampler
+                    texture = (texture_overrides.get(name, default)
+                               if name else default)
+                    channel = edge_channel
+            return
+
+        node = _read_constant_node(pkg, class_name, props)
+        if node is not None:
+            kind, value, name = node
+            if kind == 'vector':
+                rgba = vector_overrides.get(name) if name else None
+                if rgba is None:
+                    rgba = value
+                if rgba is not None:
+                    for i in range(3):
+                        color[i] *= rgba[i]
+            else:  # scalar
+                override = scalar_overrides.get(name) if name else None
+                factor = override if override is not None else value
+                if factor is not None:
+                    scale *= factor
+            return
+
+        # An edge narrowing to one channel sticks; nothing downstream widens it.
+        inputs = [(tag.name, value) for tag, value in props
+                  if tag.type_name == 'StructProperty'
+                  and tag.struct_name in _EXPRESSION_INPUT_STRUCTS]
+        if class_name == _EMISSIVE_LERP:
+            inputs = [(n, v) for n, v in inputs if n == 'A']
+        elif class_name != _EMISSIVE_MULTIPLY:
+            # A Sine, Panner, Add … is not a product; its subgraph shapes the
+            # emission spatially or in time, which glTF cannot carry, so it is
+            # left un-descended and contributes identity.
+            return
+        for _n, value in inputs:
+            visit(_read_int32(value),
+                  edge_channel or _expression_channel(value))
+
+    visit(root, root_channel)
+
+    peak_color = max(color)
+    if peak_color <= 0.0:
+        return Emissive(texture_required=had_texture)
+
+    factor = tuple(c / peak_color for c in color)
+    strength = scale * peak_color
+    mapped = _lookup_texture(tex_map, texture) if texture else None
+    return Emissive(factor, strength, mapped, channel, had_texture)
 
 
 def _get_layer_base_color_samplers(layer_name: str,
@@ -1160,28 +1354,34 @@ class _MaterialGraph:
         return self.package(_resolve_package_index(pkg, _read_int32(entry[1])))
 
 
-def read_expression_input(value: bytes) -> Tuple[Optional[int], bool]:
-    """Decode an FExpressionInput into ``(expression index, is_scalar)``.
+def _expression_channel(value: bytes) -> Optional[str]:
+    """The single channel an FExpressionInput selects, or None.
 
     The struct is native, not tagged: ``Expression`` (FPackageIndex),
     ``OutputIndex``, ``InputName`` (FName pair), then ``Mask`` and
-    ``MaskR/G/B/A`` — nine int32s.  The mask is what says *which channels* the
-    consumer reads, and it is the difference between a colour and a number: a
-    glass material's ``BaseColor = Tint * T_Statue_M.r`` reads one channel of a
-    packed mask as a scalar multiplier, not as an albedo map.  Treating that
-    texture as the base colour embeds its raw RGB — magenta and white where UE
-    shows near-flat tint.
-
-    *is_scalar* is True when the mask selects exactly one channel.  A mask of 0
-    means "whole output" and is not scalar.
+    ``MaskR/G/B/A`` — nine int32s.  ``Mask`` plus the four flags say *which
+    channels* the consumer reads, and a mask narrowing to exactly one is the
+    difference between a colour and a number: a glass material's
+    ``BaseColor = Tint * T_Statue_M.r`` reads one channel of a packed mask as a
+    scalar, not an albedo, and an emissive reading one channel is a shape the
+    writer must bake.  This is the one place that byte layout is decoded.
     """
-    index = _read_int32(value)
     if len(value) < 36:
-        return index, False
+        return None
     mask, r, g, b, a = struct.unpack_from('<5i', value, 16)
     if not mask:
-        return index, False
-    return index, (bool(r) + bool(g) + bool(b) + bool(a)) == 1
+        return None
+    selected = [name for name, on in zip('RGBA', (r, g, b, a)) if on]
+    return selected[0] if len(selected) == 1 else None
+
+
+def read_expression_input(value: bytes) -> Tuple[Optional[int], bool]:
+    """Decode an FExpressionInput into ``(expression index, is_scalar)``.
+
+    *is_scalar* is True when the mask selects exactly one channel — that is,
+    when :func:`_expression_channel` names one — so both share a single decoder.
+    """
+    return _read_int32(value), _expression_channel(value) is not None
 
 
 def _expression_inputs(pkg: Package, props: List[TaggedProperty]
