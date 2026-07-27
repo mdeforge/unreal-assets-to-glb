@@ -14,7 +14,9 @@ import numpy as np
 from tqdm import tqdm
 
 from uasset.package import Package
-from uasset.mesh import StaticMesh, MaterialSpec, export_glb, _UE_TO_GLTF_SCALE
+from uasset.mesh import (
+    ChannelSource, StaticMesh, MaterialSpec, export_glb, _UE_TO_GLTF_SCALE,
+)
 import pickle
 import hashlib
 from uasset.texture import Texture2D, export_png
@@ -22,6 +24,8 @@ from uasset.lights import camera_from_component, light_from_component
 from uasset.properties import read_properties
 from uasset.transform import rotator_to_matrix
 from uasset.scene import (
+    _DEFAULT_METALLIC,
+    _DEFAULT_ROUGHNESS,
     _build_uasset_index,
     _get_material_names_from_mesh,
     package_path_for_file,
@@ -31,6 +35,12 @@ from uasset.scene import (
 
 # Default port for both preview modes; --port overrides it.
 _PREVIEW_PORT = 3050
+
+# Layout of Export/texture_cache.pkl.  The fingerprint catches changed *input*;
+# this catches a cache written before the pickle carried everything the export
+# now reads, which no fingerprint can notice.  Bump it whenever the stored shape
+# changes, so a stale cache is rebuilt rather than half-read.
+_TEXTURE_CACHE_VERSION = 4
 
 
 # Shown by --help and by a bare invocation.  argparse substitutes %(prog)s, so
@@ -148,8 +158,68 @@ def assign_texture_filenames(textures):
     return stems
 
 
+def _channel_source(resolved, texture_cache, texture_flags):
+    """A resolved scalar input's map as a :class:`ChannelSource`.
+
+    The pixels and the source's own build-time flags live here, not in
+    ``scene.py``, for the same reason the emissive's all-black check does: this
+    is where the texture cache is.  A map the cache does not hold leaves the
+    channel a plain constant, which is the value the walk already reduced.
+
+    A texture missing from *texture_flags* is treated as linear and unflipped —
+    the two maps are filled in the same statement, so that only happens for a
+    caller that passed none at all.
+    """
+    if not resolved.texture:
+        return ChannelSource()
+    pixels = texture_cache.get(resolved.texture)
+    if pixels is None:
+        return ChannelSource()
+    srgb, _flip = (texture_flags or {}).get(resolved.texture, (False, False))
+    return ChannelSource(pixels, resolved.texture, resolved.channel,
+                         bool(srgb), resolved.invert)
+
+
+def _normal_source(package_path, texture_cache, texture_flags):
+    """A resolved normal map as a :class:`ChannelSource`.
+
+    The map is passed through whole rather than reduced to a channel, so the
+    only flag that travels is ``bFlipGreenChannel`` — carried in ``invert``,
+    which is the field the writer already reads for "this needs inverting".
+    """
+    if not package_path:
+        return ChannelSource()
+    pixels = texture_cache.get(package_path)
+    if pixels is None:
+        return ChannelSource()
+    _srgb, flip = (texture_flags or {}).get(package_path, (False, False))
+    return ChannelSource(pixels, package_path, None, False, bool(flip))
+
+
+def report_surface_coverage(tally, out=print):
+    """Report when the surface channels wholesale fell back to engine defaults.
+
+    No single material can raise this: an unwired Metallic really is 0.0 and an
+    unwired Roughness really is 0.5, so the per-material path is right to stay
+    silent.  It only reads as wrong in aggregate — a whole level of engine
+    defaults means the graphs were not found, not that the artist left them
+    blank.  That is exactly how the ``bUseMaterialAttributes`` layer stacks were
+    missed: 282 of 313 slots sat on 0.0/0.5 and nothing said a word.
+    """
+    slots = tally.get('slots', 0)
+    if not slots:
+        return
+    unwired = tally.get('surface_unwired', 0)
+    if unwired * 2 < slots:
+        return
+    out(f"  NOTE: {unwired} of {slots} material slots have neither Metallic nor "
+        f"Roughness wired and fell back to UE defaults.")
+    out(f"        That is normal for a few materials and suspicious for most — "
+        f"check whether their masters route through MaterialAttributes/layers.")
+
+
 def resolve_mesh_textures(mesh, name, uasset_index, tex_name_map, texture_cache,
-                          warn=None):
+                          texture_flags=None, warn=None, tally=None):
     """Resolve each of a mesh's polygon groups to a :class:`MaterialSpec`.
 
     Each polygon group carries an ``ImportedMaterialSlotName`` which maps to a
@@ -199,15 +269,44 @@ def resolve_mesh_textures(mesh, name, uasset_index, tex_name_map, texture_cache,
                 emissive_key = em.texture
                 emissive_channel = em.channel
 
+        # Metallic and roughness.  Both always carry a value — UE's default for
+        # an unwired input if nothing else — so what makes them worth a spec is
+        # differing from that default, which is what a slot with no spec at all
+        # already writes.
+        metallic = _channel_source(appearance.metallic, texture_cache,
+                                   texture_flags)
+        roughness = _channel_source(appearance.roughness, texture_cache,
+                                    texture_flags)
+        occlusion = _channel_source(appearance.occlusion, texture_cache,
+                                    texture_flags)
+        normal = _normal_source(appearance.normal, texture_cache,
+                                texture_flags)
+        has_surface = (metallic.pixels is not None
+                       or roughness.pixels is not None
+                       or occlusion.pixels is not None
+                       or normal.pixels is not None
+                       or appearance.metallic.value != _DEFAULT_METALLIC
+                       or appearance.roughness.value != _DEFAULT_ROUGHNESS)
+
+        if tally is not None:
+            tally['slots'] += 1
+            if not (appearance.metallic.connected
+                    or appearance.roughness.connected):
+                tally['surface_unwired'] += 1
+
         has_base = pixels is not None or appearance.alpha_mode != 'OPAQUE' \
             or appearance.factor != (1.0, 1.0, 1.0, 1.0)
-        if not has_base and emissive_strength <= 0.0:
+        if not has_base and not has_surface and emissive_strength <= 0.0:
             return None          # nothing to say about this slot
         return MaterialSpec(index, pixels, appearance.texture,
                             appearance.factor, appearance.alpha_mode,
                             appearance.alpha_cutoff,
                             emissive_factor, emissive_strength,
-                            emissive_pixels, emissive_key, emissive_channel)
+                            emissive_pixels, emissive_key, emissive_channel,
+                            appearance.metallic.value,
+                            appearance.roughness.value,
+                            metallic, roughness, normal, occlusion,
+                            appearance.occlusion.value)
 
     if mesh.material_slots and mesh.material_slot_names:
         section_map = getattr(mesh, 'section_info_map', None)
@@ -241,14 +340,15 @@ class ExportContext:
     """What a level export needs from the asset pass that precedes it."""
 
     __slots__ = ('input_dir', 'meshes', 'uasset_index', 'texture_cache',
-                 'tex_name_map')
+                 'texture_flags', 'tex_name_map')
 
     def __init__(self, input_dir, meshes, uasset_index, texture_cache,
-                 tex_name_map):
+                 texture_flags, tex_name_map):
         self.input_dir = input_dir
         self.meshes = meshes                # [(filepath, name), ...]
         self.uasset_index = uasset_index
         self.texture_cache = texture_cache
+        self.texture_flags = texture_flags
         self.tex_name_map = tex_name_map
 
     def mesh_path(self, mesh_name):
@@ -311,6 +411,10 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None,
 
     tex_success = 0
     texture_cache = {}  # package path -> numpy RGBA pixels
+    # package path -> (UTexture::SRGB, UTexture::bFlipGreenChannel).  Both are
+    # build-time transforms UE applies before a shader ever samples, so a
+    # consumer reading the *source* art has to apply them itself.
+    texture_flags = {}
     tex_name_map = {}
 
     base_color_textures = list(textures)  # export ALL textures
@@ -328,8 +432,11 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None,
         try:
             with open(cache_path, "rb") as f:
                 cached = pickle.load(f)
-            if isinstance(cached, dict) and cached.get("fingerprint") == fp_hash:
+            if (isinstance(cached, dict)
+                    and cached.get("version") == _TEXTURE_CACHE_VERSION
+                    and cached.get("fingerprint") == fp_hash):
                 texture_cache = cached["textures"]
+                texture_flags = cached["flags"]
                 tex_success = len(texture_cache)
                 cache_loaded = True
                 print(f"  Loaded {tex_success} textures from pickle cache")
@@ -350,6 +457,8 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None,
                             f"{png_stems[package_path]}.png")
                         export_png(texture, png_path)
                     texture_cache[package_path] = texture.pixels
+                    texture_flags[package_path] = (texture.srgb,
+                                                  texture.flip_green)
                     tex_success += 1
             except Exception as e:
                 tqdm.write(f"  {name}: ERROR {e}")
@@ -357,7 +466,10 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None,
         # Save pickle cache
         try:
             with open(cache_path, "wb") as f:
-                pickle.dump({"fingerprint": fp_hash, "textures": texture_cache}, f)
+                pickle.dump({"version": _TEXTURE_CACHE_VERSION,
+                             "fingerprint": fp_hash,
+                             "textures": texture_cache,
+                             "flags": texture_flags}, f)
             print(f"  Saved texture cache ({tex_success} textures) to {cache_path}")
         except Exception as e:
             print(f"  Warning: could not save texture cache: {e}")
@@ -398,6 +510,7 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None,
         meshes_to_export = meshes
 
     mesh_success = 0
+    surface_tally = Counter()
     for filepath, name in tqdm(sorted(meshes_to_export), desc="Exporting meshes", unit="mesh"):
         try:
             pkg = Package(filepath)
@@ -405,7 +518,7 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None,
             if mesh and mesh.vertices:
                 mesh_textures = resolve_mesh_textures(
                     mesh, name, uasset_index, tex_name_map, texture_cache,
-                    warn=tqdm.write)
+                    texture_flags, warn=tqdm.write, tally=surface_tally)
                 glb_path = os.path.join(export_dir, "Meshes", f"{name}.glb")
                 export_glb(mesh, glb_path,
                            textures=mesh_textures if mesh_textures else None,
@@ -415,8 +528,9 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None,
             tqdm.write(f"  {name}: ERROR {e}")
 
     print(f"Export complete: {mesh_success} meshes, {tex_success} textures")
+    report_surface_coverage(surface_tally)
     return ExportContext(input_dir, meshes, uasset_index, texture_cache,
-                         tex_name_map)
+                         texture_flags, tex_name_map)
 
 
 def export_level(input_dir, export_dir, umap_filename, context,
@@ -455,6 +569,7 @@ def export_level(input_dir, export_dir, umap_filename, context,
     # Load each distinct mesh once, with the same textures the per-mesh GLBs get
     meshes = {}
     missing = []
+    surface_tally = Counter()
     for mesh_name in tqdm(wanted, desc="Loading meshes", unit="mesh"):
         filepath = context.mesh_path(mesh_name)
         if filepath is None:
@@ -467,7 +582,8 @@ def export_level(input_dir, export_dir, umap_filename, context,
                 continue
             textures = resolve_mesh_textures(
                 mesh, mesh_name, context.uasset_index, context.tex_name_map,
-                context.texture_cache, warn=tqdm.write)
+                context.texture_cache, context.texture_flags, warn=tqdm.write,
+                tally=surface_tally)
             meshes[mesh_name] = (mesh, textures)
         except Exception as e:
             tqdm.write(f"  {mesh_name}: ERROR {e}")
@@ -476,6 +592,7 @@ def export_level(input_dir, export_dir, umap_filename, context,
     if missing:
         print(f"  {len(missing)} meshes unavailable, their actors are skipped: "
               f"{', '.join(missing[:6])}{' …' if len(missing) > 6 else ''}")
+    report_surface_coverage(surface_tally)
 
     # UE world transform per actor
     placements = []

@@ -384,6 +384,22 @@ def _parse_scalar_parameter_values(pkg: Package) -> Dict[str, float]:
     return result
 
 
+def _parse_scalar_parameter_values_keyed(pkg: Package
+                                         ) -> Dict[ParameterKey, float]:
+    """``ScalarParameterValues`` keyed by the full FMaterialParameterInfo.
+
+    A layered material reuses one parameter name per layer, so the bare-name
+    form above collapses them onto whichever serialized last.  Anything that
+    has to attribute a value to a *particular* layer reads this instead.
+    """
+    result: Dict[ParameterKey, float] = {}
+    for key, value in _parse_parameter_values(
+            pkg, 'ScalarParameterValues', 'FloatProperty'):
+        if len(value) >= 4:
+            result[key] = struct.unpack_from('<f', value, 0)[0]
+    return result
+
+
 def _parse_material_layers(pkg: Package) -> List[str]:
     """Return the material function names making up a layered instance.
 
@@ -727,22 +743,72 @@ class Emissive(NamedTuple):
     texture_required: bool = False
 
 
+# What UE uses when a material leaves an input unwired, from the attribute
+# table in MaterialAttributeDefinitionMap.cpp: Metallic 0, Roughness 0.5.  These
+# are the engine's answer for that material, not a fallback we invented — an
+# unconnected Roughness really is 0.5, and glTF's own default of 1.0 would make
+# every such surface flatter than UE renders it.
+_DEFAULT_METALLIC = 0.0
+_DEFAULT_ROUGHNESS = 0.5
+
+
+class ScalarInput(NamedTuple):
+    """One scalar material input (Metallic, Roughness) reduced for glTF.
+
+    glTF evaluates ``factor × texture.channel``, so that is the shape a UE
+    graph has to reduce to: ``value`` is the constant, ``texture``/``channel``
+    the map and the single channel read from it, and both are optional.
+
+    ``invert`` records a ``OneMinus`` wrapping the whole input — the gloss →
+    roughness idiom.  glTF has no inversion, so where it applies to a texture
+    the writer bakes ``1 - value·texel`` into the composed channel; on a bare
+    constant it is just ``1 - value``.
+
+    ``connected`` says the master wired the input at all, and ``reduced`` that
+    every node on the way was one of the handful this walk evaluates.  A graph
+    glTF cannot hold exactly — a fresnel, a function call, a lerp that is a
+    per-pixel *range* between two constants — leaves ``reduced`` False and the
+    value falls back to UE's default for the input, which the caller reports
+    rather than passing off as parsed.
+    """
+    value: float = 0.0
+    texture: Optional[str] = None
+    channel: Optional[str] = None
+    invert: bool = False
+    connected: bool = False
+    reduced: bool = True
+
+
+_METALLIC_UNSET = ScalarInput(value=_DEFAULT_METALLIC)
+_ROUGHNESS_UNSET = ScalarInput(value=_DEFAULT_ROUGHNESS)
+
+# UE's default for an unwired AmbientOcclusion is 1.0 — fully unoccluded — and
+# that is also glTF's ``occlusionTexture.strength`` default.  A material with no
+# AO input therefore writes no occlusion at all rather than a neutral map.
+_DEFAULT_OCCLUSION = 1.0
+_OCCLUSION_UNSET = ScalarInput(value=_DEFAULT_OCCLUSION)
+
+
 class MaterialAppearance(NamedTuple):
     """What the GLB writer needs to reproduce a material's base colour.
 
     ``texture`` is the base-colour map (a *tex_map* value) or None; ``factor``
     is glTF ``baseColorFactor``, which multiplies it exactly as UE's tint
     multiply does.  ``alpha_mode``/``alpha_cutoff`` carry the blend mode.
-    ``emissive`` carries the emission, split into the glTF fields.  ``notes`` is
-    what the export loop should print — a non-opaque material whose opacity
-    could not be pinned down is the case that otherwise fails silently
-    downstream.
+    ``emissive`` carries the emission and ``metallic``/``roughness`` the two
+    PBR scalars, each split into the glTF fields.  ``notes`` is what the export
+    loop should print — a non-opaque material whose opacity could not be pinned
+    down is the case that otherwise fails silently downstream.
     """
     texture: Optional[str] = None
     factor: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
     alpha_mode: str = 'OPAQUE'
     alpha_cutoff: Optional[float] = None
     emissive: Emissive = Emissive()
+    metallic: ScalarInput = _METALLIC_UNSET
+    roughness: ScalarInput = _ROUGHNESS_UNSET
+    normal: Optional[str] = None
+    occlusion: ScalarInput = _OCCLUSION_UNSET
     notes: Tuple[str, ...] = ()
 
 
@@ -915,6 +981,150 @@ def _constant_from(pkg: Package, root: Optional[int], graph: '_MaterialGraph'):
     return color, scalar
 
 
+class AttributeSource(NamedTuple):
+    """Where one material attribute's graph lives, and what overrides it.
+
+    A master that sets ``bUseMaterialAttributes`` leaves every individual pin on
+    ``MaterialEditorOnlyData`` unconnected and routes everything through
+    ``MaterialAttributes`` — usually into a layer stack, so the graph is not in
+    the master's package at all.  ``MM_Base02`` is exactly this: three nodes and
+    nothing else, while ``ML_Base`` (the layer function) carries the real
+    Metallic, Roughness, Normal and AmbientOcclusion.
+
+    ``package`` is whichever package holds the expressions, ``root`` the
+    expression the attribute reads and ``channel`` its mask.  ``textures`` and
+    ``scalars`` are the parameter values that apply *there* — for a layer that
+    means the layer instance's own values under the material instance's, since
+    a graph in a layer function is parameterised by both.
+    """
+    package: Optional[Package] = None
+    root: Optional[int] = None
+    channel: Optional[str] = None
+    textures: Dict[str, str] = {}
+    scalars: Dict[str, float] = {}
+
+
+def _make_attributes_root(pkg: Package, attribute: str
+                          ) -> Tuple[Optional[int], Optional[str]]:
+    """One named pin of a package's ``MakeMaterialAttributes`` node.
+
+    This is how a layer function publishes its result: a single node with a pin
+    per attribute.  Unlike :func:`_function_base_color_roots` there is no
+    fallback to the function's outputs — an unconnected pin means the layer
+    contributes nothing for that attribute, and following the whole bundle
+    instead would hand back some other attribute's graph.
+    """
+    for i in range(pkg.export_count):
+        if pkg.get_export_class_name(i) != 'MaterialExpressionMakeMaterialAttributes':
+            continue
+        entry = _find_prop(_read_export_properties(pkg, i), attribute,
+                           'StructProperty')
+        if entry is None:
+            return None, None
+        return _read_int32(entry[1]), _expression_channel(entry[1])
+    return None, None
+
+
+def _layer_graph_package(layer_name: str, graph: '_MaterialGraph'
+                         ) -> Tuple[Optional[Package], Dict[str, str],
+                                    Dict[str, float]]:
+    """Follow a layer slot to the function holding its graph.
+
+    A layer slot normally holds a layer *instance*, which contributes parameter
+    values and no expressions, so ``Parent`` is followed until a package with a
+    ``MakeMaterialAttributes`` turns up.  Values collected on the way replace
+    that function's defaults, nearest instance winning — the same rule
+    :func:`_get_layer_base_color_samplers` uses for base colour.
+    """
+    textures: Dict[str, str] = {}
+    scalars: Dict[str, float] = {}
+    name: Optional[str] = layer_name
+    visited = set()
+
+    while name is not None and name not in visited and len(visited) <= _MAX_FUNCTION_DEPTH:
+        visited.add(name)
+        pkg = graph.package(name)
+        if pkg is None:
+            return None, textures, scalars
+        for (param, _assoc, _index), texture in \
+                _parse_texture_parameter_values(pkg).items():
+            textures.setdefault(param, texture)
+        for param, value in _parse_scalar_parameter_values(pkg).items():
+            scalars.setdefault(param, value)
+        if any(pkg.get_export_class_name(i)
+               == 'MaterialExpressionMakeMaterialAttributes'
+               for i in range(pkg.export_count)):
+            return pkg, textures, scalars
+        name = _function_parent_name(pkg)
+
+    return None, textures, scalars
+
+
+def _attribute_source(master: Package, attribute: str,
+                      layer_name: Optional[str], graph: '_MaterialGraph',
+                      textures: Dict[str, str], scalars: Dict[str, float],
+                      keyed_textures: Dict[ParameterKey, str],
+                      keyed_scalars: Dict[ParameterKey, float]
+                      ) -> AttributeSource:
+    """Resolve where *attribute* is actually authored, layers included.
+
+    Direct pin first, because an unlayered master wires them straight.  Failing
+    that the master's own ``MakeMaterialAttributes``, and failing *that* the
+    base layer — index 0, the one the rest blend over, which is the same layer
+    base colour reads.  Blending the stack per pixel is out of scope, so one
+    layer has to stand for the surface and it must be the same one for every
+    attribute; base colour describing layer 0 while roughness described a rust
+    pass would be worse than either alone.
+    """
+    root, channel = _material_input_root(master, attribute)
+    if root:
+        return AttributeSource(master, root, channel, textures, scalars)
+
+    root, channel = _make_attributes_root(master, attribute)
+    if root:
+        return AttributeSource(master, root, channel, textures, scalars)
+
+    if not layer_name:
+        return AttributeSource()
+
+    layer_pkg, layer_tex, layer_scalars = _layer_graph_package(layer_name, graph)
+    if layer_pkg is None:
+        return AttributeSource()
+    root, channel = _make_attributes_root(layer_pkg, attribute)
+    if not root:
+        return AttributeSource()
+
+    # The material instance overrides the layer's own values, and does it with
+    # a LayerParameter keyed to this slot — so those come first, the layer
+    # instance's next, and the function's defaults last.
+    merged_tex: Dict[str, str] = {}
+    merged_scalars: Dict[str, float] = {}
+    for (name, assoc, index), value in keyed_textures.items():
+        if assoc == _LAYER_PARAMETER and index == 0:
+            merged_tex.setdefault(name, value)
+    for (name, assoc, index), fvalue in keyed_scalars.items():
+        if assoc == _LAYER_PARAMETER and index == 0:
+            merged_scalars.setdefault(name, fvalue)
+    for name, value in layer_tex.items():
+        merged_tex.setdefault(name, value)
+    for name, fvalue in layer_scalars.items():
+        merged_scalars.setdefault(name, fvalue)
+    return AttributeSource(layer_pkg, root, channel, merged_tex, merged_scalars)
+
+
+def _has_material_graph(pkg: Package) -> bool:
+    """Whether this package is the master Material — the one holding the graph.
+
+    Instances carry parameter values and no expressions, so the first package
+    up the parent chain with a ``MaterialEditorOnlyData`` export is the master.
+    Asking for the graph itself rather than for one connected input keeps a
+    material whose emissive is unwired but whose roughness is not from being
+    passed over.
+    """
+    return any(pkg.get_export_class_name(i) == 'MaterialEditorOnlyData'
+               for i in range(pkg.export_count))
+
+
 def _material_input_root(pkg: Package, input_name: str
                          ) -> Tuple[Optional[int], Optional[str]]:
     """The expression a named material output reads, and its single channel.
@@ -965,6 +1175,11 @@ def resolve_material_appearance(material_name: str,
     vector_overrides: Dict[str, Tuple[float, float, float, float]] = {}
     scalar_overrides: Dict[str, float] = {}
     texture_overrides: Dict[str, str] = {}
+    # Layered materials repeat a parameter name once per layer, so anything
+    # attributing a value to a particular layer needs the full key.
+    keyed_textures: Dict[ParameterKey, str] = {}
+    keyed_scalars: Dict[ParameterKey, float] = {}
+    layer_names: List[str] = []
 
     while name is not None and name not in visited and len(visited) <= 8:
         visited.add(name)
@@ -978,9 +1193,14 @@ def resolve_material_appearance(material_name: str,
                 vector_overrides.setdefault(key[0], rgba)
         for param, value in _parse_scalar_parameter_values(pkg).items():
             scalar_overrides.setdefault(param, value)
-        for (param, _assoc, _index), tex in \
-                _parse_texture_parameter_values(pkg).items():
-            texture_overrides.setdefault(param, tex)
+        for key, tex in _parse_texture_parameter_values(pkg).items():
+            texture_overrides.setdefault(key[0], tex)
+            keyed_textures.setdefault(key, tex)
+        for key, fvalue in _parse_scalar_parameter_values_keyed(pkg).items():
+            keyed_scalars.setdefault(key, fvalue)
+        if not layer_names:
+            # The nearest instance declaring a layer stack owns it.
+            layer_names = _parse_material_layers(pkg)
 
         if color is None:
             root, channel = _material_input_root(pkg, 'BaseColor')
@@ -990,7 +1210,7 @@ def resolve_material_appearance(material_name: str,
             root, _channel = _material_input_root(pkg, 'Opacity')
             if root:
                 _, scalar = _constant_from(pkg, root, graph)
-        if master_pkg is None and _material_input_root(pkg, 'EmissiveColor')[0]:
+        if master_pkg is None and _has_material_graph(pkg):
             master_pkg = pkg
         name = _find_parent_material_name(pkg, name)
 
@@ -1023,11 +1243,47 @@ def resolve_material_appearance(material_name: str,
         notes.append(f'emissive strength {emissive.strength:.1f} exceeds the '
                      f'engine headroom of {_EMISSIVE_STRENGTH_CEILING:.0f}')
 
+    metallic, roughness = _METALLIC_UNSET, _ROUGHNESS_UNSET
+    occlusion = _OCCLUSION_UNSET
+    normal: Optional[str] = None
+    normal_connected = False
+    if master_pkg is not None:
+        base_layer = layer_names[0] if layer_names else None
+
+        def source(attribute: str) -> AttributeSource:
+            return _attribute_source(
+                master_pkg, attribute, base_layer, graph,
+                texture_overrides, scalar_overrides,
+                keyed_textures, keyed_scalars)
+
+        metallic = _resolve_scalar_input(
+            source('Metallic'), _DEFAULT_METALLIC, tex_map)
+        roughness = _resolve_scalar_input(
+            source('Roughness'), _DEFAULT_ROUGHNESS, tex_map)
+        occlusion = _resolve_scalar_input(
+            source('AmbientOcclusion'), _DEFAULT_OCCLUSION, tex_map)
+        normal, normal_connected = _resolve_normal_texture(
+            source('Normal'), tex_map, graph)
+    for label, resolved, fallback in (('metallic', metallic, _DEFAULT_METALLIC),
+                                      ('roughness', roughness,
+                                       _DEFAULT_ROUGHNESS),
+                                      ('ambient occlusion', occlusion,
+                                       _DEFAULT_OCCLUSION)):
+        if not resolved.reduced:
+            notes.append(f'{label} does not reduce to a constant or one '
+                         f'texture channel, using UE default {fallback}')
+    if normal_connected and normal is None:
+        notes.append('normal is wired but reaches no texture in the project, '
+                     'so no normal map is written')
+
     logger.debug(f"Material '{material_name}': texture={texture} rgb={rgb} "
                  f"alpha={alpha} mode={alpha_mode} cutoff={alpha_cutoff} "
-                 f"emissive={emissive}")
+                 f"emissive={emissive} metallic={metallic} "
+                 f"roughness={roughness} normal={normal} "
+                 f"occlusion={occlusion}")
     return MaterialAppearance(texture, rgb + (alpha,), alpha_mode,
-                              alpha_cutoff, emissive, tuple(notes))
+                              alpha_cutoff, emissive, metallic, roughness,
+                              normal, occlusion, tuple(notes))
 
 
 # Emissive brights fold to a single HDR factor of factor*strength on import; the
@@ -1141,6 +1397,284 @@ def _resolve_emissive(pkg: Optional[Package], tex_map: Dict[str, str],
     strength = scale * peak_color
     mapped = _lookup_texture(tex_map, texture) if texture else None
     return Emissive(factor, strength, mapped, channel, had_texture)
+
+
+# Gloss authored as 1 - roughness.  glTF has no inversion, so the writer bakes
+# it into the channel it composes; that makes it exact only as the outermost
+# node, since 1-(a·b) is not (1-a)·(1-b).
+_ONE_MINUS = 'MaterialExpressionOneMinus'
+
+# Which component of a colour constant a scalar input reads when the edge
+# carries no mask.  UE's own default for an unmasked FExpressionInput is the
+# first component.
+_CHANNEL_COMPONENT = {'R': 0, 'G': 1, 'B': 2, 'A': 3}
+
+# UObject zero-initialises a float UPROPERTY the constructor does not touch, and
+# neither UMaterialExpressionConstant::R nor ScalarParameter::DefaultValue is
+# touched — so a constant node that serializes no value is 0.0.  Reading that as
+# "unparseable" is what made M_Glass's roughness (a parameter left at 0) look
+# like a graph this walk could not handle.
+_CONSTANT_NODE_DEFAULT = 0.0
+
+
+def _resolve_scalar_input(source: AttributeSource, default: float,
+                          tex_map: Dict[str, str]) -> ScalarInput:
+    """Reduce one scalar material input to glTF's ``factor × texture.channel``.
+
+    The walk *evaluates* the constant part of the graph and captures the first
+    texture sampler as the map, with the channel its mask selects — a packed
+    mask being exactly how UE ships metallic and roughness.  A sampler
+    contributes 1.0 to the constant, since its texels travel separately.  Four
+    node kinds are understood, each because glTF can hold the result exactly:
+
+    * a constant or scalar parameter, an instance override winning over it;
+    * a **Multiply**, the product of its two pins;
+    * a **LinearInterpolate** — evaluated properly when its Alpha is constant,
+      and otherwise taken as pin A, but only when something is *plugged into*
+      A.  A lerp between two bare constants driven by a per-pixel Alpha is a
+      *range*, not a value, and picking an endpoint invents one:
+      ``M_Brick_Clay_New`` blends ConstA −0.3 with ConstB 0.8 through a texture,
+      and reading A off it yields a negative roughness UE never renders;
+    * a **OneMinus** wrapping the whole input — the gloss idiom, carried as
+      ``invert``.  Exact only outermost, since 1−(a·b) is not (1−a)·(1−b).
+
+    Anything else — a fresnel, a clamp over a bump-offset chain, a material
+    function call — is not reduced.  Rather than fold it to a plausible number
+    the walk gives up and UE's default for the input comes back with
+    ``reduced=False``, so the caller reports it instead of passing it off as
+    parsed.  A second texture in one input is the same case: glTF holds one map
+    per slot and picking either would be a guess.
+    """
+    pkg, root, root_channel = source.package, source.root, source.channel
+    if pkg is None or not root:
+        return ScalarInput(value=default)
+    scalar_overrides = source.scalars
+    texture_overrides = source.textures
+
+    texture: Optional[str] = None
+    channel: Optional[str] = None
+    invert = False
+    visited = set()
+
+    def inputs_of(props: List[TaggedProperty]) -> Dict[str, bytes]:
+        """The node's connected expression pins, by pin name."""
+        return {tag.name: raw for tag, raw in props
+                if tag.type_name == 'StructProperty'
+                and tag.struct_name in _EXPRESSION_INPUT_STRUCTS
+                and _read_int32(raw)}
+
+    def pin_constant(props: List[TaggedProperty], name: str,
+                     fallback: float) -> float:
+        """A pin's Const<Pin> member — what UE compiles when nothing is wired."""
+        entry = _find_prop(props, name, 'FloatProperty')
+        stored = _read_float(entry[1]) if entry else None
+        return fallback if stored is None else stored
+
+    def visit(index: Optional[int], edge_channel: Optional[str],
+              is_root: bool) -> Optional[float]:
+        """The constant part of this subtree, or None if it cannot be reduced."""
+        nonlocal texture, channel, invert
+        if not index or index <= 0 or index in visited:
+            return None
+        visited.add(index)
+        exp_idx = index - 1
+        if not 0 <= exp_idx < len(pkg.exports):
+            return None
+        class_name = pkg.get_export_class_name(exp_idx)
+        props = _read_export_properties(pkg, exp_idx)
+
+        if class_name.startswith('MaterialExpressionTextureSample'):
+            if texture is not None:
+                return None                  # two maps, one slot
+            sampler = _read_sampler(pkg, props)
+            if sampler is None:
+                return None
+            name, sampled = sampler
+            texture = (texture_overrides.get(name, sampled)
+                       if name else sampled)
+            channel = edge_channel
+            return 1.0                       # the texels carry the rest
+
+        node = _read_constant_node(pkg, class_name, props)
+        if node is not None:
+            kind, constant, name = node
+            if kind == 'scalar':
+                override = scalar_overrides.get(name) if name else None
+                if override is not None:
+                    return override
+                return (_CONSTANT_NODE_DEFAULT if constant is None
+                        else constant)
+            # A colour constant feeding a scalar input contributes the one
+            # component the edge selects.
+            if constant is None:
+                return _CONSTANT_NODE_DEFAULT
+            return constant[_CHANNEL_COMPONENT.get(edge_channel or 'R', 0)]
+
+        pins = inputs_of(props)
+
+        def branch(name: str) -> Optional[float]:
+            raw = pins.get(name)
+            if raw is None:
+                return None
+            return visit(_read_int32(raw),
+                         edge_channel or _expression_channel(raw), False)
+
+        if class_name == _EMISSIVE_MULTIPLY:
+            a = (branch('A') if 'A' in pins
+                 else pin_constant(props, 'ConstA', 0.0))
+            b = (branch('B') if 'B' in pins
+                 else pin_constant(props, 'ConstB', 1.0))
+            return None if a is None or b is None else a * b
+
+        if class_name == _EMISSIVE_LERP:
+            if 'Alpha' not in pins:
+                alpha = pin_constant(props, 'ConstAlpha', 0.5)
+                a = (branch('A') if 'A' in pins
+                     else pin_constant(props, 'ConstA', 0.0))
+                b = (branch('B') if 'B' in pins
+                     else pin_constant(props, 'ConstB', 1.0))
+                if a is None or b is None:
+                    return None
+                return a * (1.0 - alpha) + b * alpha
+
+            if 'A' in pins:
+                # Something is authored into A, so the lerp is that signal with
+                # a second state blended over it — a distance fade, a wetness
+                # pass.  The first endpoint is the material, the same rule base
+                # colour and emissive use; Alpha is not descended into, since
+                # its texture is a weight rather than this input's map.
+                return branch('A')
+
+            # Both endpoints are bare constants, so lerp(a, b, t) = a + (b-a)·t
+            # and the *alpha* carries the detail.  glTF holds factor × texel, so
+            # this is exact in two shapes and a per-pixel range in every other:
+            # a == 0 gives b·t, and lerp(1, 0, t) gives 1 - t, which is the
+            # inversion the writer already bakes.  M_Shelf's metallic is the
+            # first (a plain mask), M_Tech_Hex_Tile's the second.
+            a = pin_constant(props, 'ConstA', 0.0)
+            b = (branch('B') if 'B' in pins
+                 else pin_constant(props, 'ConstB', 1.0))
+            alpha = branch('Alpha')
+            if b is None or alpha is None:
+                return None
+            if a == 0.0:
+                return b * alpha
+            if is_root and a == 1.0 and b == 0.0:
+                invert = True
+                return alpha
+            return None
+
+        if class_name == _ONE_MINUS and is_root:
+            inner = branch('Input')
+            if inner is None:
+                return None
+            invert = True
+            return inner
+
+        return None
+
+    value = visit(root, root_channel, True)
+    if value is None:
+        return ScalarInput(value=default, connected=True, reduced=False)
+
+    mapped = _lookup_texture(tex_map, texture) if texture else None
+    if texture is not None and mapped is None:
+        # The map is outside the project (engine content, or a parameter left
+        # at a default that ships with the engine).  The constant alone is not
+        # what UE renders, so this is a miss, not a result.
+        return ScalarInput(value=default, connected=True, reduced=False)
+
+    if mapped is None and invert:
+        value = 1.0 - value
+        invert = False
+    # UE saturates both inputs at the shading model and glTF requires [0,1] of
+    # its factors, so the two agree that anything outside is not a value.
+    return ScalarInput(value=min(1.0, max(0.0, value)), texture=mapped,
+                       channel=channel, invert=invert, connected=True)
+
+
+# Pins that never carry a normal.  A lerp's Alpha is a blend weight and a
+# bump-offset's Height is a displacement scalar; following either would hand
+# back a mask texture as though it were the surface normal.  Everything else is
+# left to the breadth-first order and the single-channel rule below, because
+# pruning by pin name is what made this walk miss maps it should have found.
+_NORMAL_SKIP_PINS = frozenset({'Alpha', 'Height'})
+
+
+def _resolve_normal_texture(source: AttributeSource, tex_map: Dict[str, str],
+                            graph: '_MaterialGraph'
+                            ) -> Tuple[Optional[str], bool]:
+    """The tangent-space normal map a material's ``Normal`` input reads.
+
+    Returns ``(texture, connected)``.  Unlike metallic and roughness there is
+    nothing to evaluate: glTF's ``normalTexture`` is the map itself, so the walk
+    just has to reach the right sampler.  It follows the first input of the
+    blend nodes a normal graph uses and descends into material functions, since
+    a shared "blend two normals" function is where the sampler often lives.
+
+    A material whose Normal is a constant — the flat ``(0, 0, 1)`` a master
+    writes when it has no map — reaches no sampler and gets no normalTexture,
+    which is exactly right: the interpolated vertex normal is the answer.
+    """
+    pkg, root = source.package, source.root
+    if pkg is None or not root:
+        return None, False
+    texture_overrides = source.textures
+
+    queue = deque([(pkg, root, 0)])
+    visited = set()
+
+    while queue and len(visited) < _MAX_EXPRESSION_NODES:
+        node_pkg, index, depth = queue.popleft()
+        if not index or index <= 0:
+            continue
+        step = (node_pkg.filepath, index)
+        if step in visited:
+            continue
+        visited.add(step)
+        exp_idx = index - 1
+        if not 0 <= exp_idx < len(node_pkg.exports):
+            continue
+
+        class_name = node_pkg.get_export_class_name(exp_idx)
+        props = _read_export_properties(node_pkg, exp_idx)
+
+        if class_name.startswith('MaterialExpressionTextureSample'):
+            sampler = _read_sampler(node_pkg, props)
+            if sampler is not None:
+                name, sampled = sampler
+                texture = (texture_overrides.get(name, sampled)
+                           if name else sampled)
+                mapped = _lookup_texture(tex_map, texture) if texture else None
+                if mapped is not None:
+                    return mapped, True
+            continue
+
+        if depth < _MAX_FUNCTION_DEPTH:
+            called = graph._called_function(node_pkg, props)
+            if called is not None:
+                # A layer function publishes through MakeMaterialAttributes, so
+                # its Normal pin is the branch to follow; a plain function has
+                # no such node and its outputs are the whole result.
+                f_root, _f_channel = _make_attributes_root(called, 'Normal')
+                roots = ([(f_root, False)] if f_root
+                         else _function_base_color_roots(called))
+                for f_root, _scalar in roots:
+                    queue.append((called, f_root, depth + 1))
+
+        # Pins are read array-aware: a MaterialFunctionCall keeps whatever is
+        # plugged into it in ``FunctionInputs``, and when the function itself is
+        # engine content that cannot be opened, those pins are the *only* route
+        # to the map.  A single-channel edge is skipped because a tangent-space
+        # normal needs three; that is the same parsed-mask rule base colour uses,
+        # and it is what keeps a lerp's packed weight from being mistaken for a
+        # normal without having to prune whole branches by name.
+        for pin, index, masked in _named_expression_inputs(node_pkg, props):
+            if masked or pin in _NORMAL_SKIP_PINS or not index:
+                continue
+            queue.append((node_pkg, index, depth))
+
+    return None, True
 
 
 def _get_layer_base_color_samplers(layer_name: str,
@@ -1396,17 +1930,50 @@ def _expression_inputs(pkg: Package, props: List[TaggedProperty]
     see :func:`read_expression_input` for why the mask has to travel with the
     edge.
     """
-    inputs: List[Tuple[Optional[int], bool]] = []
+    return [(index, masked) for _name, index, masked
+            in _named_expression_inputs(pkg, props)]
+
+
+def _is_struct_array(tag) -> bool:
+    """Whether an ArrayProperty tag may hold structs.
+
+    The element type only reaches the outer tag from PROPERTY_TAG_COMPLETE_TYPE_NAME
+    on; before that ``inner_types`` is empty and the type lives in an FPropertyTag
+    written *inside* the value, which :func:`_iter_struct_array` already reads.
+    Requiring the outer tag to name StructProperty therefore skipped every array
+    on an older package — and ``MaterialFunctionCall.FunctionInputs`` is where
+    the textures live whenever a graph blends through an engine function it
+    cannot open.  ``M_Rock``'s two normal maps sat behind exactly that.
+
+    An array that turns out to hold something else parses to nothing: the walk
+    below still requires an expression-input struct name to use an element.
+    """
+    if tag.type_name != 'ArrayProperty':
+        return False
+    return 'StructProperty' in tag.inner_types or not tag.inner_types
+
+
+def _named_expression_inputs(pkg: Package, props: List[TaggedProperty]
+                             ) -> List[Tuple[str, Optional[int], bool]]:
+    """Every expression a node's inputs point at, with pin name and mask.
+
+    The pin name matters to a caller that treats inputs differently — a normal
+    walk must not follow a lerp's ``Alpha`` — so it is kept here and dropped by
+    :func:`_expression_inputs` for callers that do not care.
+    """
+    inputs: List[Tuple[str, Optional[int], bool]] = []
     for tag, value in props:
         if tag.type_name == 'StructProperty':
             if tag.struct_name in _EXPRESSION_INPUT_STRUCTS:
-                inputs.append(read_expression_input(value))
-        elif tag.type_name == 'ArrayProperty' and 'StructProperty' in tag.inner_types:
+                index, masked = read_expression_input(value)
+                inputs.append((tag.name, index, masked))
+        elif _is_struct_array(tag):
             for element in _iter_struct_array(pkg, value):
                 for inner, inner_value in element:
                     if (inner.type_name == 'StructProperty'
                             and inner.struct_name in _EXPRESSION_INPUT_STRUCTS):
-                        inputs.append(read_expression_input(inner_value))
+                        index, masked = read_expression_input(inner_value)
+                        inputs.append((inner.name, index, masked))
     return inputs
 
 
