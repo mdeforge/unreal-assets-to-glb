@@ -252,15 +252,36 @@ def _is_encoded_source(compression_format: int, source_data: dict,
     return raw_data[:4] == _PNG_MAGIC or raw_data[:3] == _JPEG_MAGIC
 
 
+# Source formats whose bytes are ordered B, G, R, A.  A PNG/JPEG source is a
+# *container* for the declared format, so these need the same swap the raw path
+# applies — the encoding does not reorder anything.
+_BGRA_ORDERED_FORMATS = frozenset({
+    TSF_FORMAT_MAP['TSF_BGRA8'], TSF_FORMAT_MAP['TSF_BGRE8'],
+})
+
+
 def _decode_encoded_source(tex: 'Texture2D', raw_data: bytes) -> 'Texture2D':
-    """Decode PNG/JPEG source art into RGBA pixels."""
+    """Decode PNG/JPEG source art into RGBA pixels.
+
+    The container is a PNG or JPEG, but what UE stored inside it is the source
+    in its *declared* pixel format: for TSF_BGRA8 that is B, G, R, A bytes
+    wearing a PNG's RGBA labels.  Trusting the container leaves red and blue
+    transposed, which is subtle enough to survive a long time — StarterContent's
+    clay brick decoded bluer than it was red, and T_Chair_N came out
+    (254, 128, 128) instead of a tangent-space (128, 128, 255).  The raw path
+    swaps for exactly this reason; so must this one.
+    """
     try:
         img = Image.open(BytesIO(raw_data))
-        tex.pixels = np.array(img.convert('RGBA'))
+        pixels = np.array(img.convert('RGBA'))
     except Exception as e:
         raise ValueError(
             f"could not decode {tex.compression_format_str} source art: {e}")
 
+    if tex.format in _BGRA_ORDERED_FORMATS:
+        pixels[:, :, [0, 2]] = pixels[:, :, [2, 0]]     # BGRA -> RGBA
+
+    tex.pixels = pixels
     tex.width = img.width
     tex.height = img.height
     tex.format = TSF_FORMAT_MAP['TSF_BGRA8']
@@ -276,7 +297,8 @@ class Texture2D:
     """Parsed uncooked Texture2D from a UE 5.5 .uasset package."""
 
     __slots__ = ('width', 'height', 'format', 'format_str',
-                 'compression_format', 'compression_format_str', 'pixels')
+                 'compression_format', 'compression_format_str', 'pixels',
+                 'srgb', 'flip_green')
 
     def __init__(self):
         self.width = 0
@@ -286,6 +308,14 @@ class Texture2D:
         self.compression_format = -1
         self.compression_format_str = '?'
         self.pixels: Optional[np.ndarray] = None  # HxWxC uint8
+        # UTexture::SRGB, which defaults to true.  A consumer that reads these
+        # pixels as *data* — a packed metallic/roughness mask — needs to know,
+        # since UE decodes an sRGB-flagged source before the shader sees it.
+        self.srgb = True
+        # UTexture::bFlipGreenChannel, which defaults to false.  UE inverts
+        # green when *building* the texture, so source art is pre-flip and a
+        # normal map carrying this flag has to be flipped here instead.
+        self.flip_green = False
 
     @classmethod
     def from_package(cls, pkg: Package) -> Optional['Texture2D']:
@@ -311,6 +341,13 @@ class Texture2D:
         # The Source struct is returned as raw bytes by read_properties, then
         # parsed here — its inner tags use the same layout as the outer ones.
         props = read_properties(data_reader, pkg.name_map, pkg.file_version_ue5)
+        # Serialized only when it differs from the CDO, so an absent SRGB means
+        # UTexture's default of true — which is what `srgb` is initialised to.
+        srgb = props.get('SRGB')
+        if isinstance(srgb, bool):
+            tex.srgb = srgb
+        tex.flip_green = props.get('bFlipGreenChannel') is True
+
         source_struct = props.get('Source')
         if not isinstance(source_struct, bytes):
             raise ValueError("no FTextureSource struct in export data")

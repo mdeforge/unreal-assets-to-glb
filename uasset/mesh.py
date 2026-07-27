@@ -26,6 +26,8 @@ try:
         Perspective,
         PbrMetallicRoughness,
         TextureInfo,
+        NormalMaterialTexture,
+        OcclusionTextureInfo,
         Texture as GLTFTexture,
         Sampler,
         Image as GLTFImage,
@@ -471,6 +473,8 @@ def extract_mesh_data(elements: dict) -> Optional[dict]:
         'vertices': [],
         'vi_to_vertex': [],
         'normals': [],
+        'tangents': [],
+        'binormal_signs': [],
         'uvs': [],       # List of UV channel arrays
         'triangles': [],
     }
@@ -515,6 +519,31 @@ def extract_mesh_data(elements: dict) -> Optional[dict]:
             x, y, z = struct.unpack_from('<fff', raw, i * 12)
             normals.append((x, y, z))
         result['normals'] = _maybe_expand_sparse(normals, vi_ch, default=(0.0, 0.0, 1.0))
+
+    # --- Tangents (per vertex instance) ---
+    # glTF's TANGENT is a vec4: the tangent plus a handedness sign that fixes
+    # which way the bitangent points.  UE keeps the two apart, as ``Tangent``
+    # and ``BinormalSign``, so both are read and recombined by the writer.
+    # Only exported because a normal map is: without a tangent basis a consumer
+    # has to invent one, and it will not be the basis the map was baked against.
+    tangent_data = _extract_attr_data(vi_ch, 'Tangent', expected_type=1)
+    if tangent_data:
+        raw = tangent_data['data']
+        count = tangent_data['count']
+        tangents = []
+        for i in range(count):
+            x, y, z = struct.unpack_from('<fff', raw, i * 12)
+            tangents.append((x, y, z))
+        result['tangents'] = _maybe_expand_sparse(tangents, vi_ch,
+                                                  default=(1.0, 0.0, 0.0))
+
+    sign_data = _extract_attr_data(vi_ch, 'BinormalSign', expected_type=3)
+    if sign_data:
+        raw = sign_data['data']
+        count = sign_data['count']
+        signs = [struct.unpack_from('<f', raw, i * 4)[0] for i in range(count)]
+        result['binormal_signs'] = _maybe_expand_sparse(signs, vi_ch,
+                                                        default=1.0)
 
     # --- UV coordinates (per vertex instance, channel 0 = texture UV) ---
     uv_channels = []
@@ -840,6 +869,11 @@ class StaticMesh:
     def __init__(self):
         self.vertices: List[Tuple[float, float, float]] = []
         self.normals: List[Tuple[float, float, float]] = []
+        # Tangent basis, per vertex instance, kept as UE keeps it: the tangent
+        # and the sign that orients the bitangent.  glTF wants them combined
+        # into one vec4, which _build_primitives does.
+        self.tangents: List[Tuple[float, float, float]] = []
+        self.binormal_signs: List[float] = []
         self.uvs: List[List[Tuple[float, float]]] = []  # list of UV channels
         self.triangles: List[Tuple[int, int, int, int]] = []  # (vi0, vi1, vi2, material_index)
         self.vi_to_vertex: List[int] = []
@@ -884,6 +918,8 @@ class StaticMesh:
         mesh.vertices = mesh_data['vertices']
         mesh.vi_to_vertex = mesh_data['vi_to_vertex']
         mesh.normals = mesh_data['normals']
+        mesh.tangents = mesh_data['tangents']
+        mesh.binormal_signs = mesh_data['binormal_signs']
         mesh.uvs = mesh_data['uvs']
         mesh.triangles = mesh_data['triangles']
         mesh.material_slot_names = mesh_data.get('material_slot_names')
@@ -986,12 +1022,38 @@ def ue_matrix_to_gltf(matrix: np.ndarray,
     return [float(v) for v in converted.T.flatten()]
 
 
+class ChannelSource(NamedTuple):
+    """Where one scalar PBR channel's per-pixel values come from.
+
+    Metallic and roughness each reduce to ``factor × texture.channel``, so each
+    needs the pixels, the identity to dedup them by, and which channel of them
+    to read — three fields that would otherwise be six flat members on
+    :class:`MaterialSpec`.  ``srgb`` is the source texture's own SRGB flag: a
+    metallic-roughness map is linear data, so a source UE decodes as sRGB has
+    to be decoded here too.  ``invert`` carries a gloss authored as
+    ``1 - roughness``, which is baked when the channel is composed.
+
+    All-default means the channel is a plain constant with no map.
+    """
+    pixels: object = None
+    key: Optional[str] = None
+    channel: Optional[str] = None
+    srgb: bool = False
+    invert: bool = False
+
+
 class MaterialSpec(NamedTuple):
     """One material slot's appearance, as the GLB writer wants it.
 
     A plain ``(material_index, pixels, key)`` tuple still works wherever this
-    is accepted — the extra fields default to an opaque, untinted material —
-    so callers that only have a texture need not build one of these.
+    is accepted — the extra fields default to an opaque, untinted, non-emissive
+    material — so callers that only have a texture need not build one of these.
+
+    Emission is carried already decomposed: ``emissive_factor`` is the
+    normalized tint (≤1), ``emissive_strength`` the magnitude (>0 turns it on),
+    ``emissive_pixels`` the emissive colour map or None, and
+    ``emissive_channel`` the single channel to bake out when the map is a packed
+    mask rather than a colour image.
     """
     material_index: int
     pixels: object = None
@@ -999,6 +1061,25 @@ class MaterialSpec(NamedTuple):
     factor: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
     alpha_mode: str = 'OPAQUE'
     alpha_cutoff: Optional[float] = None
+    emissive_factor: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    emissive_strength: float = 0.0
+    emissive_pixels: object = None
+    emissive_key: Optional[str] = None
+    emissive_channel: Optional[str] = None
+    # UE's own defaults for an unwired input, so a caller that only has a
+    # texture describes a rough dielectric rather than glTF's default mirror.
+    metallic_factor: float = 0.0
+    roughness_factor: float = 0.5
+    metallic: ChannelSource = ChannelSource()
+    roughness: ChannelSource = ChannelSource()
+    # Tangent-space normal map, passed through rather than composed: glTF's
+    # normalTexture *is* the map.  ``srgb``/``invert`` are unused on this one;
+    # ``channel`` is too, since a normal needs all three.
+    normal: ChannelSource = ChannelSource()
+    # Baked ambient occlusion.  glTF reads occlusion from R and scales it by
+    # ``strength``, which is where the reduced constant goes.
+    occlusion: ChannelSource = ChannelSource()
+    occlusion_strength: float = 1.0
 
 
 def _as_rgba(pixels) -> np.ndarray:
@@ -1012,6 +1093,163 @@ def _as_rgba(pixels) -> np.ndarray:
         alpha = np.full(array.shape[:2] + (1,), 255, dtype=array.dtype)
         return np.concatenate([array, alpha], axis=2)
     raise ValueError(f"unsupported base-colour channel count {array.shape[2]}")
+
+
+_CHANNEL_INDEX = {'R': 0, 'G': 1, 'B': 2, 'A': 3}
+
+
+def _srgb_encode(linear: np.ndarray) -> np.ndarray:
+    """Encode a linear [0,1] array to sRGB, the inverse of the importer's decode.
+
+    Callers pass a mask already in [0,1], so no clamp is needed before the power.
+    """
+    return np.where(linear <= 0.0031308,
+                    linear * 12.92,
+                    1.055 * np.power(linear, 1 / 2.4) - 0.055)
+
+
+def _emissive_rgb(pixels, channel: Optional[str]) -> Optional[np.ndarray]:
+    """The emissive colour map as an RGB uint8 image, or None if it is black.
+
+    A full-colour emissive texture is already sRGB-encoded in the source, so it
+    passes straight through — the importer loads it sRGB and the shader
+    multiplies it by the factor, exactly as authored.  A single-channel mask is
+    a *shape*, not a colour: the importer has no scalar emissive input, so the
+    channel is extracted to a grey RGB image.  Its values are a linear
+    multiplier, so they are sRGB-encoded here to survive the importer's sRGB
+    decode unchanged.
+    """
+    array = np.asarray(pixels)
+    if channel is not None:
+        idx = _CHANNEL_INDEX.get(channel, 0)
+        if array.ndim < 3 or idx >= array.shape[2]:
+            return None
+        mask = array[..., idx].astype(np.float32) / 255.0
+        if float(mask.max()) <= 0.0:
+            return None
+        encoded = (_srgb_encode(mask) * 255.0 + 0.5).astype(np.uint8)
+        return np.stack([encoded] * 3, axis=-1)
+    if array.ndim == 2:
+        array = np.stack([array] * 3, axis=-1)
+    rgb = array[..., :3]
+    if int(rgb.max()) == 0:
+        return None
+    return np.ascontiguousarray(rgb)
+
+
+def _srgb_decode(encoded: np.ndarray) -> np.ndarray:
+    """Decode an sRGB [0,1] array to linear — the inverse of :func:`_srgb_encode`."""
+    return np.where(encoded <= 0.04045,
+                    encoded / 12.92,
+                    np.power((encoded + 0.055) / 1.055, 2.4))
+
+
+def _scalar_channel(source: 'ChannelSource', shape) -> Optional[np.ndarray]:
+    """One source texture's channel as a linear float array of *shape*.
+
+    An unmasked edge reads the first component, which is what UE does when an
+    FExpressionInput selects no channel.  Two packed masks of different sizes
+    can feed one material, so the plane is resampled to the shared shape.
+    """
+    array = np.asarray(source.pixels)
+    if array.ndim == 2:
+        array = array[..., np.newaxis]
+    if array.ndim != 3:
+        return None
+    index = _CHANNEL_INDEX.get(source.channel or 'R', 0)
+    if index >= array.shape[2]:
+        index = 0
+    plane = array[..., index]
+    if plane.shape != shape:
+        from PIL import Image as PILImage
+        plane = np.asarray(PILImage.fromarray(plane).resize(
+            (shape[1], shape[0]), PILImage.BILINEAR))
+    values = plane.astype(np.float32) / 255.0
+    if source.srgb:
+        # A metallic-roughness map is linear data.  UE decodes an sRGB-flagged
+        # source before the shader sees it, so the same decode happens here or
+        # the midtones come out rougher than UE renders them.
+        values = _srgb_decode(values)
+    return values
+
+
+def _metallic_roughness_image(spec: 'MaterialSpec') -> Optional[np.ndarray]:
+    """Compose the glTF metallic-roughness map, or None if both are constants.
+
+    glTF packs **roughness in G and metallic in B** of one linear image, while
+    UE reads each from whichever channel of whichever packed mask the graph
+    names — so the image is composed here rather than forwarded.  Composing is
+    also what keeps import-contract rule 4 satisfiable: the ``_M`` file feeding
+    this slot stays free to feed a colour slot elsewhere, because the bytes
+    written here are a new image either way.  R is left at 1.0; occlusion is
+    out of scope and a consumer reading R finds no occlusion rather than a
+    wrong one.
+
+    A channel with no source is left at 1.0 so its glTF factor passes through
+    unchanged.  An inverted (gloss) channel folds its factor into the pixels,
+    which is why :meth:`_GLBBuilder._apply_metallic_roughness` writes 1.0 for
+    that factor.
+    """
+    sources = [s for s in (spec.metallic, spec.roughness)
+               if s.pixels is not None]
+    if not sources:
+        return None
+
+    shape = max((np.asarray(s.pixels).shape[:2] for s in sources),
+                key=lambda hw: hw[0] * hw[1])
+    rgb = np.full(shape + (3,), 255, dtype=np.uint8)
+
+    for source, index, factor in ((spec.roughness, 1, spec.roughness_factor),
+                                  (spec.metallic, 2, spec.metallic_factor)):
+        if source.pixels is None:
+            continue
+        values = _scalar_channel(source, shape)
+        if values is None:
+            continue
+        if source.invert:
+            # 1 - factor·texel is not factor × texel, so the constant folds
+            # into the pixels and the glTF factor becomes 1.
+            values = 1.0 - values * factor
+        rgb[..., index] = (np.clip(values, 0.0, 1.0) * 255.0 + 0.5).astype(
+            np.uint8)
+
+    return rgb
+
+
+def _normal_rgb(source: 'ChannelSource') -> Optional[np.ndarray]:
+    """A tangent-space normal map as an RGB uint8 image, or None if unusable.
+
+    The source is passed through — it is already the encoded normal, and
+    re-deriving it would only lose precision.  The one transform is UE's
+    ``bFlipGreenChannel``, which UE applies while *building* the texture: the
+    source art is pre-flip, so a flagged map has to be inverted here or it
+    lights from the wrong vertical direction.  glTF and UE otherwise agree on
+    the convention (+Y up, OpenGL-style), so nothing else is touched.
+    """
+    array = np.asarray(source.pixels)
+    if array.ndim == 2:
+        array = np.stack([array] * 3, axis=-1)
+    if array.ndim != 3 or array.shape[2] < 3:
+        return None
+    rgb = np.ascontiguousarray(array[..., :3])
+    if source.invert:                       # carries bFlipGreenChannel
+        rgb = rgb.copy()
+        rgb[..., 1] = 255 - rgb[..., 1]
+    return rgb
+
+
+def _occlusion_rgb(source: 'ChannelSource') -> Optional[np.ndarray]:
+    """Baked AO as an RGB uint8 image, or None if the channel is unreadable.
+
+    glTF reads occlusion from **R** only.  All three channels are written with
+    the same values anyway: it costs almost nothing after PNG compression, and
+    it keeps the map readable in any viewer instead of looking red-tinted.
+    """
+    values = _scalar_channel(source, np.asarray(source.pixels).shape[:2])
+    if values is None:
+        return None
+    grey = (np.clip(values, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    return np.ascontiguousarray(np.stack([grey] * 3, axis=-1))
 
 
 def _check_import_contract(mat, base_color_image) -> None:
@@ -1081,15 +1319,19 @@ class _GLBBuilder:
         # glTF texture index -> 'color' | 'data', so the same image is never
         # asked to be both.  See _note_texture_slot.
         self._texture_slot_kind: Dict[int, str] = {}
+        # Set once any material writes KHR_materials_emissive_strength, so the
+        # extension is declared in extensionsUsed at save time.
+        self._emissive_strength_used = False
 
     def _note_texture_slot(self, texture_index: int, kind: str) -> None:
         """Record which colour space a texture is being used in, and enforce it.
 
         An importer that dedupes by image and classifies colour space on first
         use decodes the loser wrong: base colour and emissive are sRGB, while
-        normal, metallic-roughness and occlusion are linear.  Only base colour
-        is written today, so this cannot fire yet — it exists so that adding a
-        normal or MR map cannot quietly reuse a base-colour image.
+        normal, metallic-roughness and occlusion are linear.  Both kinds are
+        written now, so this is live: the metallic-roughness map is composed
+        into a new image precisely so that a packed mask feeding it can still
+        feed a colour slot elsewhere without one of the two decoding wrong.
         """
         previous = self._texture_slot_kind.setdefault(texture_index, kind)
         if previous != kind:
@@ -1193,6 +1435,209 @@ class _GLBBuilder:
             self.samplers.append(sampler)
         return 0
 
+    def _embed_texture(self, pil_img, identity) -> int:
+        """Embed a PIL image as a PNG texture, reusing it if already embedded.
+
+        Keyed on *identity* — the texture's package path — so a level that
+        shares one texture across dozens of meshes stores its pixels once.
+        """
+        from io import BytesIO
+        if identity is not None and identity in self._texture_index:
+            return self._texture_index[identity]
+
+        buf = BytesIO()
+        pil_img.save(buf, format='PNG')
+        bv_idx = self._add_buffer_view(buf.getvalue())
+
+        img = GLTFImage()
+        img.bufferView = bv_idx
+        img.mimeType = 'image/png'
+        self.images.append(img)
+
+        tex = GLTFTexture()
+        tex.source = len(self.images) - 1
+        tex.sampler = self._sampler()
+        self.textures.append(tex)
+
+        tex_index = len(self.textures) - 1
+        if identity is not None:
+            self._texture_index[identity] = tex_index
+        return tex_index
+
+    def _apply_metallic_roughness(self, mat, spec: 'MaterialSpec') -> None:
+        """Write metallicFactor/roughnessFactor and, where wired, their map.
+
+        The factors are UE's own numbers — including its defaults for an input
+        the material leaves unwired (metallic 0, roughness 0.5), which is why
+        neither glTF default is relied on: glTF's ``metallicFactor`` defaults to
+        1.0, so a surface UE renders as a dielectric would import as a mirror.
+
+        An inverted channel has had its factor baked into the composed pixels
+        (see :func:`_metallic_roughness_image`), so 1.0 is written for it here —
+        computed from the flag rather than from the bake, so a cached image
+        still gets the right factor.
+        """
+        from PIL import Image as PILImage
+        pbr = mat.pbrMetallicRoughness
+        has_metallic = spec.metallic.pixels is not None
+        has_roughness = spec.roughness.pixels is not None
+        pbr.metallicFactor = float(
+            1.0 if (has_metallic and spec.metallic.invert)
+            else spec.metallic_factor)
+        pbr.roughnessFactor = float(
+            1.0 if (has_roughness and spec.roughness.invert)
+            else spec.roughness_factor)
+
+        if not (has_metallic or has_roughness):
+            return
+
+        # Bake once per distinct composition — a level shares one packed mask
+        # across dozens of materials.  The baked-in factor joins the key only
+        # where an inversion folded it into the pixels; otherwise two materials
+        # differing solely by factor still share the image, as they should.
+        key = ('metallic-roughness',
+               spec.metallic.key, spec.metallic.channel,
+               spec.metallic_factor if spec.metallic.invert else None,
+               spec.roughness.key, spec.roughness.channel,
+               spec.roughness_factor if spec.roughness.invert else None)
+        identified = spec.metallic.key is not None or spec.roughness.key is not None
+        tex_index = self._texture_index.get(key) if identified else None
+        if tex_index is None:
+            rgb = _metallic_roughness_image(spec)
+            if rgb is None:
+                return
+            tex_index = self._embed_texture(
+                PILImage.fromarray(rgb, 'RGB'), key if identified else None)
+
+        tex_info = TextureInfo()
+        tex_info.index = tex_index
+        tex_info.texCoord = 0
+        pbr.metallicRoughnessTexture = tex_info
+        # Rule 4: this image is linear data, never a colour map.  It is freshly
+        # composed, so it can never be an image a colour slot already claimed.
+        self._note_texture_slot(tex_index, 'data')
+
+    def _apply_normal(self, mat, spec: 'MaterialSpec') -> None:
+        """Write ``normalTexture`` where the material wires one.
+
+        The image is embedded under its own key namespace rather than shared
+        with a colour slot's copy of the same pixels.  A normal map is linear
+        data and a colour map is sRGB (contract rule 4), and an importer that
+        classifies colour space on first use would decode one of them wrong;
+        keeping the identities separate makes that unrepresentable rather than
+        merely unlikely.
+        """
+        from PIL import Image as PILImage
+        if spec.normal.pixels is None:
+            return
+
+        key = ('normal', spec.normal.key, spec.normal.invert)
+        tex_index = (self._texture_index.get(key)
+                     if spec.normal.key else None)
+        if tex_index is None:
+            rgb = _normal_rgb(spec.normal)
+            if rgb is None:
+                return
+            tex_index = self._embed_texture(
+                PILImage.fromarray(rgb, 'RGB'),
+                key if spec.normal.key else None)
+
+        info = NormalMaterialTexture()
+        info.index = tex_index
+        info.texCoord = 0
+        # `scale` is left at its default of 1.0: UE expresses normal strength as
+        # graph arithmetic on the sampled vector, and reading a single number
+        # back out of that would be a guess.
+        mat.normalTexture = info
+        self._note_texture_slot(tex_index, 'data')
+
+    def _apply_occlusion(self, mat, spec: 'MaterialSpec') -> None:
+        """Write ``occlusionTexture`` (+ strength) where the material bakes AO.
+
+        Kept as its own image rather than packed into the metallic-roughness
+        map's unused R channel.  ORM packing is the usual glTF optimisation, but
+        the consumer here wants the two separate, and a separate map is also
+        what lets a baked AO share nothing with the MR dedup key.
+        """
+        from PIL import Image as PILImage
+        if spec.occlusion.pixels is None:
+            return
+
+        key = ('occlusion', spec.occlusion.key, spec.occlusion.channel,
+               spec.occlusion.srgb, spec.occlusion.invert)
+        tex_index = (self._texture_index.get(key)
+                     if spec.occlusion.key else None)
+        if tex_index is None:
+            rgb = _occlusion_rgb(spec.occlusion)
+            if rgb is None:
+                return
+            tex_index = self._embed_texture(
+                PILImage.fromarray(rgb, 'RGB'),
+                key if spec.occlusion.key else None)
+
+        info = OcclusionTextureInfo()
+        info.index = tex_index
+        info.texCoord = 0
+        if spec.occlusion_strength != 1.0:
+            info.strength = float(spec.occlusion_strength)
+        mat.occlusionTexture = info
+        self._note_texture_slot(tex_index, 'data')
+
+    def _apply_emissive(self, mat, spec: 'MaterialSpec') -> None:
+        """Write a material's emission as emissiveFactor (+ strength, + texture).
+
+        The factor is already normalized to ≤1 and the >1 magnitude lives in
+        ``KHR_materials_emissive_strength``, because glTF clamps the factor to
+        [0,1] and an over-1 factor would be silently capped.  Where the emission
+        has a colour map it is embedded as an sRGB image kept out of the
+        data-map dedup bucket (``_note_texture_slot``); a packed-mask channel is
+        baked to RGB first (``_emissive_rgb``).
+        """
+        from PIL import Image as PILImage
+        if spec.emissive_strength <= 0.0:
+            return
+
+        tex_index = None
+        if spec.emissive_pixels is not None:
+            # Bake once per distinct (texture, channel): a level shares one
+            # emissive map across many meshes, and the sRGB bake of a 2048²
+            # mask is far more expensive than the embed dedup that already
+            # follows it — so the cache is checked *before* baking.  A cached
+            # texture was embedded once, so it is known non-black.
+            key = ('emissive', spec.emissive_key, spec.emissive_channel)
+            tex_index = (self._texture_index.get(key)
+                         if spec.emissive_key else None)
+            if tex_index is None:
+                rgb = _emissive_rgb(spec.emissive_pixels, spec.emissive_channel)
+                if rgb is None:
+                    return          # the map is all black — nothing emits
+                image = PILImage.fromarray(rgb, 'RGB')
+                tex_index = self._embed_texture(
+                    image, key if spec.emissive_key else None)
+
+        # Rule 2: an emissiveFactor of zero would multiply any texture to
+        # nothing, so it is forced non-zero.  A normalized tint already has a
+        # component at 1; a degenerate all-zero factor falls back to white.
+        factor = list(spec.emissive_factor)
+        if tex_index is not None and not any(factor):
+            factor = [1.0, 1.0, 1.0]
+        mat.emissiveFactor = factor
+
+        strength = spec.emissive_strength
+        if strength != 1.0:
+            mat.extensions = dict(mat.extensions or {})
+            mat.extensions['KHR_materials_emissive_strength'] = {
+                'emissiveStrength': float(strength)
+            }
+            self._emissive_strength_used = True
+
+        if tex_index is not None:
+            tex_info = TextureInfo()
+            tex_info.index = tex_index
+            tex_info.texCoord = 0
+            mat.emissiveTexture = tex_info
+            self._note_texture_slot(tex_index, 'color')
+
     def add_mesh(self, mesh: 'StaticMesh',
                  textures: Optional[List[Tuple[int, object]]] = None,
                  name: Optional[str] = None) -> Optional[int]:
@@ -1203,6 +1648,7 @@ class _GLBBuilder:
         # Primary UV channel only
         uvs = mesh.uvs[0] if mesh.uvs else []
         has_normals = bool(mesh.normals)
+        has_tangents = bool(mesh.tangents)
         has_uvs = bool(uvs)
 
         # Group triangles by material index
@@ -1274,8 +1720,7 @@ class _GLBBuilder:
             mat = Material()
             mat.pbrMetallicRoughness = PbrMetallicRoughness()
             mat.pbrMetallicRoughness.baseColorFactor = list(spec.factor)
-            mat.pbrMetallicRoughness.metallicFactor = 0.0
-            mat.pbrMetallicRoughness.roughnessFactor = 1.0
+            self._apply_metallic_roughness(mat, spec)
             if spec.alpha_mode != 'OPAQUE':
                 mat.alphaMode = spec.alpha_mode
                 if spec.alpha_mode == 'MASK' and spec.alpha_cutoff is not None:
@@ -1284,31 +1729,10 @@ class _GLBBuilder:
                 # cutout leaf is meaningless backface-culled.
                 mat.doubleSided = True
 
+            base_color_image = None
             if mat_idx in texture_lookup:
-                pil_img, identity = texture_lookup[mat_idx]
-                tex_index = self._texture_index.get(identity) if identity else None
-
-                if tex_index is None:
-                    buf = BytesIO()
-                    pil_img.save(buf, format='PNG')
-                    png_bytes = buf.getvalue()
-
-                    bv_idx = self._add_buffer_view(png_bytes)
-
-                    img = GLTFImage()
-                    img.bufferView = bv_idx
-                    img.mimeType = 'image/png'
-                    self.images.append(img)
-
-                    tex = GLTFTexture()
-                    tex.source = len(self.images) - 1
-                    tex.sampler = self._sampler()
-                    self.textures.append(tex)
-
-                    tex_index = len(self.textures) - 1
-                    if identity is not None:
-                        self._texture_index[identity] = tex_index
-
+                base_color_image, identity = texture_lookup[mat_idx]
+                tex_index = self._embed_texture(base_color_image, identity)
                 tex_info = TextureInfo()
                 tex_info.index = tex_index
                 # texCoord 0 always: only TEXCOORD_0 is written, and a consumer
@@ -1318,12 +1742,15 @@ class _GLBBuilder:
                 mat.pbrMetallicRoughness.baseColorTexture = tex_info
                 self._note_texture_slot(tex_index, 'color')
 
-            _check_import_contract(mat, pil_img if mat_idx in texture_lookup
-                                   else None)
+            self._apply_normal(mat, spec)
+            self._apply_occlusion(mat, spec)
+            self._apply_emissive(mat, spec)
+
+            _check_import_contract(mat, base_color_image)
             self.materials.append(mat)
             mat_idx_to_gltf_mat[mat_idx] = len(self.materials) - 1
 
-        self._build_primitives(mesh, uvs, has_normals, has_uvs,
+        self._build_primitives(mesh, uvs, has_normals, has_tangents, has_uvs,
                                material_groups, sorted_mat_indices,
                                mat_idx_to_gltf_mat, gltf_primitives)
 
@@ -1336,7 +1763,7 @@ class _GLBBuilder:
         self.meshes.append(gltf_mesh)
         return len(self.meshes) - 1
 
-    def _build_primitives(self, mesh, uvs, has_normals, has_uvs,
+    def _build_primitives(self, mesh, uvs, has_normals, has_tangents, has_uvs,
                           material_groups, sorted_mat_indices,
                           mat_idx_to_gltf_mat, gltf_primitives):
         """One primitive per material group, in glTF axes."""
@@ -1354,7 +1781,7 @@ class _GLBBuilder:
 
             # Collect unique vertex instances for this primitive
             vi_to_local: dict = {}
-            local_verts: list = []  # (px, py, pz, nx, ny, nz, u, v)
+            local_verts: list = []  # (px,py,pz, nx,ny,nz, u,v, tx,ty,tz,tw)
             indices: list = []
 
             for vi0, vi1, vi2 in tris:
@@ -1373,6 +1800,22 @@ class _GLBBuilder:
                         else:
                             nx, ny, nz = 0.0, 1.0, 0.0
 
+                        # Tangent — same conversion for the direction, but the
+                        # handedness has to be *negated*.  The axis swap has
+                        # determinant -1, and a cross product does not survive a
+                        # mirror unchanged: cross(Ma, Mb) = -M·cross(a, b) for an
+                        # orthogonal M with det -1.  glTF defines the bitangent as
+                        # cross(N, T.xyz)·T.w, so w = -BinormalSign.  Get this
+                        # wrong and every normal map lights from the wrong side.
+                        if has_tangents and vi < len(mesh.tangents):
+                            t = mesh.tangents[vi]
+                            tx, ty, tz = t[1], t[2], -t[0]
+                            sign = (mesh.binormal_signs[vi]
+                                    if vi < len(mesh.binormal_signs) else 1.0)
+                            tw = -1.0 if sign >= 0.0 else 1.0
+                        else:
+                            tx, ty, tz, tw = 1.0, 0.0, 0.0, 1.0
+
                         # UV — no V-flip needed: UE5 stores textures top-to-bottom
                         # (same as PNG/glTF), and the UV coordinate (0,0) already
                         # maps to the first pixel row in both engines.
@@ -1381,7 +1824,8 @@ class _GLBBuilder:
                         else:
                             u, v = 0.0, 0.0
 
-                        local_verts.append((px, py, pz, nx, ny, nz, u, v))
+                        local_verts.append((px, py, pz, nx, ny, nz, u, v,
+                                            tx, ty, tz, tw))
                         vi_to_local[vi] = len(local_verts) - 1
 
                     indices.append(vi_to_local[vi])
@@ -1395,6 +1839,8 @@ class _GLBBuilder:
             pos_arr = np.array([(v[0], v[1], v[2]) for v in local_verts], dtype=np.float32)
             norm_arr = np.array([(v[3], v[4], v[5]) for v in local_verts], dtype=np.float32)
             uv_arr = np.array([(v[6], v[7]) for v in local_verts], dtype=np.float32)
+            tan_arr = np.array([(v[8], v[9], v[10], v[11]) for v in local_verts],
+                               dtype=np.float32)
 
             if num_verts <= 65535:
                 idx_arr = np.array(indices, dtype=np.uint16)
@@ -1415,6 +1861,14 @@ class _GLBBuilder:
                 norm_bv = _add_buffer_view(norm_arr.tobytes(), target=ARRAY_BUFFER)
                 norm_acc = _add_accessor(norm_bv, COMP_FLOAT, num_verts, "VEC3")
 
+            # Tangent accessor.  glTF requires NORMAL alongside TANGENT and
+            # ignores a tangent basis without UVs, so it is written only when
+            # both are present.
+            tan_acc = None
+            if has_tangents and has_normals and has_uvs:
+                tan_bv = _add_buffer_view(tan_arr.tobytes(), target=ARRAY_BUFFER)
+                tan_acc = _add_accessor(tan_bv, COMP_FLOAT, num_verts, "VEC4")
+
             # UV accessor
             uv_acc = None
             if has_uvs:
@@ -1430,6 +1884,8 @@ class _GLBBuilder:
             prim.attributes.POSITION = pos_acc
             if norm_acc is not None:
                 prim.attributes.NORMAL = norm_acc
+            if tan_acc is not None:
+                prim.attributes.TANGENT = tan_acc
             if uv_acc is not None:
                 prim.attributes.TEXCOORD_0 = uv_acc
             prim.indices = idx_acc
@@ -1459,12 +1915,16 @@ class _GLBBuilder:
             gltf.images = self.images
         if self.cameras:
             gltf.cameras = self.cameras
+        used = list(gltf.extensionsUsed or [])
         if self.lights:
             gltf.extensions = dict(gltf.extensions or {})
             gltf.extensions['KHR_lights_punctual'] = {'lights': self.lights}
-            used = list(gltf.extensionsUsed or [])
             if 'KHR_lights_punctual' not in used:
                 used.append('KHR_lights_punctual')
+        if self._emissive_strength_used \
+                and 'KHR_materials_emissive_strength' not in used:
+            used.append('KHR_materials_emissive_strength')
+        if used:
             gltf.extensionsUsed = used
         gltf.accessors = self.accessors
         gltf.bufferViews = self.buffer_views
